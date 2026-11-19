@@ -1,0 +1,1428 @@
+/**
+ * dsh-archive-manager — Host half.
+ *
+ * 本机 HTTP 路由（loopback，Cache-Control: no-store；非 GET 要求自定义头
+ * `x-dsh-plugin: session-delete` 作最低限度 CSRF 防线——自定义头跨域必触发
+ * 预检，而本服务不答 CORS 预检）：
+ *   GET  /api/session-delete/list           全量会话清单（清理面板数据源）
+ *   GET  /api/session-delete/preview?id=    单会话删除预览
+ *   POST /api/session-delete/delete         { id } 归档 + 移入回收站（保留归档隐藏）
+ *   GET  /api/session-delete/trash          回收站清单
+ *   POST /api/session-delete/restore        { entry } 原位还原 + 自动解除归档
+ *   POST /api/session-delete/unarchive      { id } 在线解除归档（旧版回退 501）
+ *   POST /api/session-delete/purge          { entry? , all? } 彻底删除（保留归档隐藏）
+ *   ---- fork 新增（v0.5.1-fork.1）----
+ *   POST /api/session-delete/delete-permanent { id } 一步永久删除（跳过回收站直接抹除，仿 Codex 侧栏入口）
+ *   GET  /api/session-delete/config          自动归档配置读取
+ *   POST /api/session-delete/config          自动归档配置保存（校验 + 重排定时器）
+ *   POST /api/session-delete/auto-archive/run 立即执行一次自动归档扫描
+ *   POST /api/session-delete/purge-archived  永久删除全部已归档会话（仿 zcodex「全部永久删除」）
+ *
+ * 删除流水线（顺序不可换）：
+ *   1. 运行保护：agents.get(id) 存在且 status !== 'idle' → 拒绝
+ *   2. workspaceRegistry.archiveSession(id) —— 必须在文件移动之前调用：
+ *      官方实现要求会话「live 或仍在持久化清单中」，归档后宿主会向客户端
+ *      广播 host/archived-sessions-changed，侧栏即时隐藏；
+ *   3. sessionPersistence.locate(header) 定位真实磁盘目录（不硬编码路径）；
+ *   4. rename 移入 <DSH_HOME>/trash/sessions/<时间戳>-<转义id>/data/（回收站；
+ *      id 经 encodeEntrySegment 转义成文件系统安全片段，见 ID_RE 注释 / issue #3）；
+ *   5. 归档 id 保留（keptHidden），运行期间永不摘除：
+ *      客户端侧栏的行来自内存 list store——只有 host/session-removed 帧
+ *      （仅 live 会话 dispose 时宿主才发）或全新的 session.list 基线才能把
+ *      行移除；冷会话被删后宿主不发任何帧，行一直留在已连接客户端的 store
+ *      里。此时若把 id 摘出归档集，archived-sessions-changed 广播会把这条
+ *      残留行重新显示回侧栏（"删除后又回到工作区"）；live 会话同理（宿主
+ *      session.list 无条件从内存吐活会话，DSH 也没有公开的他人 agent 卸载
+ *      API——dispose 闭包私有于 agent-loop 工厂）。归档集只是隐藏标记：
+ *      没有行的 ghost id 在官方 UI 里不渲染任何东西，保留代价为零。
+ *      ghost 的最终清理由「宿主重启时的 reconcile」完成（见 apply 尾部）：
+ *      重启后所有客户端都用全新基线重建 store，已删会话的行不复存在，此时
+ *      摘除归档 id 不可能复活任何东西。操作方客户端删除后还会主动调
+ *      sessions.refresh() 剪掉自己 store 里的残留行（见 client 半）。
+ *      live 会话后续的 flush 会因父目录已移走而 ENOENT 失败（append 用
+ *      open("a") 但目录不存在），不会在磁盘上重建会话。
+ *
+ * 审计：<DSH_HOME>/trash/sessions/audit.log（JSONL 追加）。
+ *
+ * 已知边界（有意为之，见 README）：
+ *   - 取消归档没有公开 API，走 registry 内部状态机（enqueueOperation /
+ *     requireState / setState，与 archiveSession 同源）。setState 落盘触发
+ *     domain/changed(workspace)，宿主 apiproxy 检测到归档集变化后自动广播
+ *     host/archived-sessions-changed，侧栏即时恢复——与归档传播完全对称。
+ *     能力探测失败（未来版本内部变更）时：/unarchive 回退 501 UNSUPPORTED；
+ *     重启 reconcile 同样静默跳过（旧版无法改 archivedSessionIds，ghost
+ *     只能由 tools/unhide.mjs 离线清理）。
+ *   - 投影缓存 session_projcache.json 中可能残留死条目（无害，重启自愈）。
+ *   - 搜索索引（sqlite）按磁盘清单 reconcile，文件消失后自动清行。
+ */
+import { appendFile, mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { dirname, join, resolve } from 'node:path'
+import { homedir } from 'node:os'
+
+export const name = 'session-delete'
+export const inject = ['webServer', 'sessionPersistence', 'workspaceRegistry', 'agents']
+
+const PREFIX = '/api/session-delete'
+/** 自定义头防跨站 POST（见文件头注释）。 */
+const PLUGIN_HEADER = 'x-dsh-plugin'
+/**
+ * 会话 id 白名单（宽进严出：仍要求存在于磁盘清单，见 inventory()）。
+ *
+ * DSH 核心契约：SessionId 是 unvalidated branded string——dsh-session-persistence-jsonl
+ * 明言「it MUST be encoded before use in a path」，即 id 的字符集没有任何保证，
+ * 落盘转义是使用方（本插件）的义务，而不是对 id 的格式要求。因此本白名单只承担
+ * 防注入职责（拒绝 `/`、`\`、空白、控制字符等），不假设 id 是文件系统安全的；
+ * id 落盘（回收站条目名）前一律经 encodeEntrySegment 转义（issue #3）。
+ *
+ * 已知四类 id 形态：
+ *   - session-<uuid>                       主会话（dsh-headless / dsh-session 生成）
+ *   - <uuid>                               可延续子代理（dsh-subagent startContinuable）
+ *   - <id>-session-<uuid>                  配置子代理（dsh-agent-loop 生成）
+ *   - im:<渠道>:dm:<seq>:<uid>@<host>      IM 渠道（dsh-im-connect 生成，含
+ *                                          `:`/`@`/`_`/`.`；`:` 是 Windows 保留字符，
+ *                                          直接拼目录名会 ENOENT——绝不能进条目名）
+ */
+const ID_RE = /^[A-Za-z0-9._:@~-]{8,200}$/
+/**
+ * 回收站条目名白名单（<UTC 紧凑时间戳>-<encodeEntrySegment(id)>，无路径分隔符）。
+ * 字符集必须严格等于 encodeEntrySegment 的输出字符集：含 `~`（转义前缀），
+ * 绝不能含 `:` / `@`——条目名会真实落成目录名，而 `:` 在 Windows 上非法
+ * （issue #3 第二层）。只加一半会出现「删得掉、但还原/彻底删除失败」的新坑。
+ * 上限 240 保证最坏情况（15 位时间戳 + '-' + 转义膨胀）仍在 Linux/Windows
+ * 单文件名 255 上限内；deleteSession 在动手前硬校验条目名落在本正则内，
+ * 维持不变式：凡删除成功创建的条目必然能 restore / purge（不自造死条目）。
+ */
+const ENTRY_RE = /^[A-Za-z0-9._~-]{1,240}$/
+/** 回收站根内的保留文件名（审计日志），不可作为条目操作。 */
+const AUDIT_LOG = 'audit.log'
+
+// ---------------------------------------------------------------------------
+// 小工具
+// ---------------------------------------------------------------------------
+
+function httpError(statusCode, code, message) {
+  return Object.assign(new Error(message), { statusCode, code })
+}
+
+/** 递归求目录字节占用；不可读条目按 0 计，不抛错。 */
+async function dirSize(path) {
+  let total = 0
+  let entries
+  try {
+    entries = await readdir(path, { withFileTypes: true })
+  } catch {
+    return 0
+  }
+  for (const entry of entries) {
+    const child = join(path, entry.name)
+    if (entry.isDirectory()) total += await dirSize(child)
+    else if (entry.isFile()) {
+      try {
+        total += (await stat(child)).size
+      } catch {
+        /* 并发消失的文件忽略 */
+      }
+    }
+  }
+  return total
+}
+
+async function dirMtime(path) {
+  try {
+    return (await stat(path)).mtimeMs
+  } catch {
+    return 0
+  }
+}
+
+/** 回收站条目名：<UTC 紧凑时间戳>-<会话 id>。 */
+function entryStamp() {
+  return new Date().toISOString().replace(/[-:]/g, '').replace(/\..+$/, '').replace('T', '-')
+}
+
+/** encodeEntrySegment 的原样保留字符集（与核心 encodeSegment 一致，不含 `~`）。 */
+const SAFE_SEG_CH = /^[A-Za-z0-9._-]$/
+/**
+ * 会话 id → 可安全用作单个目录名的片段（`~XXXX` 转义）。
+ *
+ * 与 DSH 核心 dsh-session-persistence-jsonl 的 encodeSegment 保持同一策略与
+ * 同一输出（逐字符对齐，含 `.`/`..` 整体转义与 `~` 自身转义）：SessionId 是
+ * unvalidated branded string，落盘前必须转义（issue #3）。安全字符原样保留，
+ * 其余字符（`:`、`@`、`/`、`\`、空白、`~`……）转为 `~` + 大写十六进制 4 位。
+ * 仅用于条目命名：restore / purge 的会话 id 一律取自条目内 meta.json，
+ * 绝不从条目名反解（转义单射但双向兼容由 meta.json 保证，勿改成反解）。
+ */
+function encodeEntrySegment(raw) {
+  if (raw.length === 0) throw new Error('cannot encode an empty path segment')
+  if (raw === '.') return '~002E'
+  if (raw === '..') return '~002E~002E'
+  let out = ''
+  for (let i = 0; i < raw.length; i++) {
+    const code = raw.charCodeAt(i)
+    const ch = String.fromCharCode(code)
+    if (ch !== '~' && SAFE_SEG_CH.test(ch)) out += ch
+    else out += '~' + code.toString(16).toUpperCase().padStart(4, '0')
+  }
+  return out
+}
+
+// ---------------------------------------------------------------------------
+// 插件本体
+// ---------------------------------------------------------------------------
+
+export function apply(ctx) {
+  /** 缓存的 DSH home（trash 根的父目录）。 */
+  let cachedHome = null
+
+  /**
+   * 兼容两代 persistence.list() 的返回形状：
+   *   - 旧版（≤0.1.1-rc.x）：直接返回 header 数组；
+   *   - 0.1.5+：返回 { header, revision, sizeBytes } 快照数组。
+   * 统一解包成 header 数组。不解包的话 wrapper 会被当 header 用：
+   * h.id / h.cwd 全为 undefined，locate(wrapper) 深入到
+   * encodeSegment(undefined) 后抛 "reading 'length'"（v0.4.0 在
+   * DSH 0.1.5-alpha 上 /list、/trash 全挂的根因）。
+   * header 自身 schema 无 header 字段，`in` 判别不会误伤。
+   */
+  async function listHeaders() {
+    const result = await ctx.sessionPersistence.list()
+    if (!Array.isArray(result)) return []
+    return result.map((item) => (item !== null && typeof item === 'object' && 'header' in item ? item.header : item))
+  }
+
+  /**
+   * DSH home 推导：优先从任一现存会话的 locate() 路径反推
+   * （<home>/sessions/<projectKey>/<session-id>/session.jsonl.zstd），
+   * 无会话时退回 DSH_HOME / ~/.dsh。
+   */
+  async function dshHome() {
+    if (cachedHome) return cachedHome
+    const headers = await listHeaders()
+    for (const header of headers) {
+      const location = ctx.sessionPersistence.locate(header)
+      if (location && typeof location.path === 'string') {
+        const sessionsRoot = resolve(dirname(location.path), '../..')
+        cachedHome = resolve(sessionsRoot, '..')
+        return cachedHome
+      }
+    }
+    cachedHome = process.env.DSH_HOME ? resolve(process.env.DSH_HOME) : join(homedir(), '.dsh')
+    return cachedHome
+  }
+
+  async function trashRoot() {
+    return join(await dshHome(), 'trash', 'sessions')
+  }
+
+  async function audit(action, fields) {
+    const line = JSON.stringify({ at: new Date().toISOString(), action, ...fields })
+    try {
+      const root = await trashRoot()
+      await mkdir(root, { recursive: true })
+      await appendFile(join(root, AUDIT_LOG), line + '\n')
+    } catch {
+      /* 审计失败不阻断主流程 */
+    }
+  }
+
+  /** 磁盘会话清单：id → header。 */
+  async function inventory() {
+    const headers = await listHeaders()
+    const byId = new Map(headers.map((h) => [h.id, h]))
+    return { headers, byId }
+  }
+
+  function agentState(id) {
+    const agent = ctx.agents.get(id)
+    if (agent === undefined) return { live: false, running: false }
+    const status = agent.status
+    return { live: true, running: status !== 'idle' }
+  }
+
+  function archivedSet() {
+    try {
+      return new Set(ctx.workspaceRegistry.archivedSessionIds ?? [])
+    } catch {
+      return new Set()
+    }
+  }
+
+  /**
+   * 在线取消归档（archiveSession 的对称反操作）。
+   *
+   * registry 没有公开的 unarchive API，但其内部状态机与归档同源：
+   * enqueueOperation（串行队列）→ requireState → setState（写 global 存储）。
+   * setState 落盘触发 domain/changed(workspace)，apiproxy 检测到
+   * archivedSessionIds 变化后向所有客户端广播 host/archived-sessions-changed，
+   * 侧栏原分组即时恢复显示——无需自建任何通知管道。
+   *
+   * 这些是内部方法而非公开契约：能力探测失败（未来版本改名/收窄）时抛
+   * 501 UNSUPPORTED，由客户端回退到「停止 DSH 后运行 tools/unhide.mjs」。
+   */
+  function registryCanUnarchive() {
+    const registry = ctx.workspaceRegistry
+    return (
+      typeof registry?.unarchiveSession === 'function' ||
+      (typeof registry?.enqueueOperation === 'function' &&
+        typeof registry?.requireState === 'function' &&
+        typeof registry?.setState === 'function')
+    )
+  }
+
+  async function unarchiveSession(id) {
+    const registry = ctx.workspaceRegistry
+    if (!registryCanUnarchive()) {
+      throw httpError(501, 'UNSUPPORTED', '当前 DSH 的 workspaceRegistry 不支持在线取消归档；请停止 DSH 后运行 tools/unhide.mjs')
+    }
+    const wasArchived = archivedSet().has(id)
+    if (typeof registry.unarchiveSession === 'function') {
+      // 新版 DSH：走公开的 unarchiveSession，内部自带串行队列 + 落盘 + 广播，
+      // 与归档完全对称。
+      await registry.unarchiveSession(id)
+    } else {
+      // 旧版 DSH 回退：手动走内部状态机（与 archiveSession 同源），保持原兼容性。
+      await registry.enqueueOperation(async () => {
+        const state = registry.requireState()
+        if (!Array.isArray(state.archivedSessionIds) || !state.archivedSessionIds.includes(id)) return false
+        await registry.setState({
+          ...state,
+          archivedSessionIds: state.archivedSessionIds.filter((x) => x !== id),
+        })
+        return true
+      })
+    }
+    return wasArchived && !archivedSet().has(id)
+  }
+
+  /**
+   * 删除/清空后的归档 ghost 清理（best-effort）。
+   *
+   * delete 会先 archiveSession 再移盘：id 因此留在 workspace.json 的
+   * global.archivedSessionIds 里。磁盘会话已不存在时，官方归档计数仍会虚高。
+   * 这里在文件操作成功后批量摘掉这些 id；旧版无内部状态机时静默跳过，
+   * 清理失败也不回滚已完成的删除/清空。
+   */
+  async function forgetArchivedSessions(ids) {
+    const wanted = [...new Set((ids ?? []).filter((id) => typeof id === 'string' && id))]
+    if (wanted.length === 0 || !registryCanUnarchive()) return 0
+    const registry = ctx.workspaceRegistry
+    const drop = new Set(wanted)
+    try {
+      return await registry.enqueueOperation(async () => {
+        const state = registry.requireState()
+        if (!Array.isArray(state.archivedSessionIds) || state.archivedSessionIds.length === 0) return 0
+        const next = state.archivedSessionIds.filter((id) => !drop.has(id))
+        const removed = state.archivedSessionIds.length - next.length
+        if (removed === 0) return 0
+        await registry.setState({
+          ...state,
+          archivedSessionIds: next,
+        })
+        return removed
+      })
+    } catch {
+      return 0
+    }
+  }
+
+  /**
+   * 清掉「归档集里有、磁盘清单里没有」的历史 ghost。
+   * 只在宿主重启（插件重新挂载）时调用：此刻所有客户端都会用全新基线重建
+   * list store，已删会话的行不复存在，摘除归档 id 不会复活任何东西。
+   * 运行期间绝不调用——长连客户端的 store 可能还持有已删会话的残留行，
+   * 摘除归档会把它们显示回侧栏。
+   * live 会话除外（boot 时配置启动的 agent 已 resume，但它们都在盘上，
+   * 不会命中 ghost 条件；保留检查作纵深防御）。
+   */
+  async function reconcileArchivedGhosts() {
+    if (!registryCanUnarchive()) return 0
+    const archived = [...archivedSet()]
+    if (archived.length === 0) return 0
+    const { byId } = await inventory()
+    const ghosts = archived.filter((id) => !byId.has(id) && !agentState(id).live)
+    if (ghosts.length === 0) return 0
+    const forgotten = await forgetArchivedSessions(ghosts)
+    if (forgotten > 0) await audit('reconcile-archived-ghosts', { count: forgotten, ids: ghosts.slice(0, 20) })
+    return forgotten
+  }
+
+  /** 标题批量折叠（sessionQuery 可选；失败逐项回退）。 */
+  async function titlesFor(ids) {
+    const query = ctx.get('sessionQuery')
+    if (query === undefined || ids.length === 0) return new Map()
+    try {
+      const results = await query.readTitleSnapshots(ids)
+      const map = new Map()
+      for (const r of results) {
+        if (r?.status !== 'fulfilled' || r.value?.title === undefined) continue
+        // readTitleSnapshots 的 title 是 SessionTitleSnapshot 对象（含 messageSeqs/
+        // source/eventSeq/updatedAt），不是字符串——必须解包出 .title 文本，
+        // 否则对象流到客户端会被当 React 子节点渲染（Minified error #31）。
+        const snap = r.value.title
+        const text = typeof snap === 'string' ? snap : typeof snap?.title === 'string' ? snap.title : null
+        if (text !== null) map.set(r.value.session.id, text)
+      }
+      return map
+    } catch {
+      return new Map()
+    }
+  }
+
+  /**
+   * 零 I/O 标题：sessionProjectionCache 的 title 投影行——与侧栏 session.list
+   * 同源（打开页面即预热），冷会话首次加载不再逐个 zstd 解压整个日志
+   * （readTitleSnapshots 的 readColdSessionLog 路径；几百个会话时秒级）。
+   * 缓存行可能略旧但绝不会串会话（identity 以 createdAt/cwd/inheritedEventCount
+   * 见证，不匹配即拒）；seeded 会话按官方 apiproxy 同款规则走 predecessor 探测。
+   * miss / 服务缺失 / 旧版 API 不符时返回 undefined，由调用方回退解压路径。
+   * 仅用于冷会话：live 会话的标题在内存里本就新鲜且免费（readTitleSnapshots
+   * 对 live 走 sourceLive，无解压），避免吃到落后的检查点。
+   */
+  function cachedTitleFor(header) {
+    const cache = ctx.get('sessionProjectionCache')
+    if (cache === undefined || typeof cache?.cachedSnapshot !== 'function') return { title: undefined, via: 'no-service' }
+    // 旧格式（v0）会话的持久化 header 不带 isSeeded 字段（undefined），而投影
+    // 缓存的 identity 匹配只对存储侧做 `?? false` 默认——期望侧是 undefined 时
+    // lifecycle 永远不等，snapshot/predecessor 双双落空（实测 predecessor 0 命中，
+    // 每次重启首次加载退回全量解压）。这里把 identity 输入归一为 false。
+    const meta = header.isSeeded === undefined ? { ...header, isSeeded: false } : header
+    try {
+      const block = meta.isSeeded
+        ? undefined
+        : cache.cachedSnapshot(meta, 0, ['title'])
+      if (block !== undefined && typeof block.values?.title === 'string') return { title: block.values.title, via: 'snapshot' }
+      if (typeof cache.cachedPredecessorTitle === 'function') {
+        const pred = cache.cachedPredecessorTitle(meta, 0)
+        if (pred !== undefined && typeof pred.values?.title === 'string') return { title: pred.values.title, via: 'predecessor' }
+      }
+      return { title: undefined, via: 'miss' }
+    } catch (error) {
+      return { title: undefined, via: `error:${String(error?.message ?? error).slice(0, 60)}` }
+    }
+  }
+
+  /**
+   * 记录缓存：id → { key, title, sizeBytes, mtimeMs }。
+   * key = 日志文件 `mtime:size`——标题折叠需要 zstd 解压整个日志（44 个会话
+   * 约 0.7s），但内容只有追加一种变化方式，文件 mtime+size 不变即可复用。
+   * live 会话不缓存（内存态可能领先于磁盘）。
+   */
+  const recordCache = new Map()
+
+  /**
+   * 阶段 1：逐会话预检（并行，纯 stat 无解压）。
+   * locate → stat 日志文件 → mtime 缓存命中判定。返回 prep 数组供后续阶段
+   * 与 buildRecord 复用（不重复 stat）。
+   *
+   * locate() 返回的是「当前代」文件名（如 session.v3.jsonl.zstd）——这是
+   * 追加写入的目标路径。尚未迁移的旧格式会话磁盘上只有旧代文件
+   * （version 0 保留原名 session.jsonl.zstd），对它们 stat locate 路径必然
+   * ENOENT；若就此放弃，mtime 缓存永远无法为这些会话升温（每次全量重算，
+   * 旧格式存量越多越慢——v0.5.1 之前 8s 稳态的元凶之一）。这里在 ENOENT
+   * 时回退：readdir 会话目录，选版本号最高的那代日志文件作为缓存键源。
+   */
+  const GEN_RE = /^session(?:\.v(\d+))?\.jsonl(?:\.zstd)?$/
+  async function locateLogFile(dir, locatedPath) {
+    try {
+      await stat(locatedPath)
+      return locatedPath
+    } catch {
+      /* 当前代文件不存在：扫描目录找实际存在的最高代 */
+    }
+    try {
+      const entries = await readdir(dir, { withFileTypes: true })
+      let best = null
+      let bestVer = -1
+      for (const e of entries) {
+        if (!e.isFile()) continue
+        const m = GEN_RE.exec(e.name)
+        if (m === null) continue
+        const ver = m[1] === undefined ? 0 : Number(m[1])
+        if (ver > bestVer) {
+          bestVer = ver
+          best = join(dir, e.name)
+        }
+      }
+      return best
+    } catch {
+      return null
+    }
+  }
+
+  async function prepRecords(ids, byId) {
+    return (
+      await Promise.all(
+        ids.map(async (id) => {
+          const header = byId.get(id)
+          if (header === undefined) return null
+          const location = ctx.sessionPersistence.locate(header)
+          const dir = location && typeof location.path === 'string' ? dirname(location.path) : null
+          let key = null
+          if (dir !== null) {
+            const logFile = await locateLogFile(dir, location.path)
+            if (logFile !== null) {
+              try {
+                const st = await stat(logFile)
+                key = `${st.mtimeMs}:${st.size}`
+              } catch {
+                key = null
+              }
+            }
+          }
+          const agent = agentState(id)
+          const cached = recordCache.get(id)
+          // live 会话不缓存（内存态可能领先于磁盘）；日志 mtime+size 不变即可复用
+          const hit = !agent.live && key !== null && cached !== undefined && cached.key === key
+          return { id, header, dir, key, agent, cached, hit }
+        }),
+      )
+    ).filter((p) => p !== null)
+  }
+
+  /**
+   * 阶段 2：标题批量解析（仅对阶段 1 的缓存未命中者）。
+   *
+   * 关键性能约束：readTitleSnapshots 每次调用内部都会重扫整个持久化清单
+   * （listPersisted），逐会话单调用是准平方级——520 个会话实测 60s 都跑不完
+   * （v0.5.0 的教训）。miss 必须合并成一次批量调用，其内部自带
+   * persistedReadConcurrency 并发池解压。投影缓存命中（侧栏 session.list
+   * 同源，打开页面即预热）则完全绕开解压路径；recordCache 命中者标题随
+   * 缓存行返回，无需解析。live 会话不经投影缓存（内存标题更新鲜），归入
+   * miss 批——批量调用对 live 走 sourceLive 内存快照，无解压成本。
+   *
+   * @returns {{titles: Map<string, string|null>, stats: object}} id → 标题文本 + 来源统计
+   */
+  async function resolveTitles(preps) {
+    const titles = new Map()
+    const misses = []
+    const stats = { recordHits: 0, snapshot: 0, predecessor: 0, miss: 0, noService: 0, errors: {} }
+    // 根因验证字段：持久化 header 里 isSeeded 缺失（undefined）的会话数——
+    // 这正是投影缓存 identity 匹配对旧格式会话全部落空的前提（见 cachedTitleFor）。
+    stats.headerNoIsSeeded = 0
+    for (const p of preps) {
+      if (p.header.isSeeded === undefined) stats.headerNoIsSeeded += 1
+      if (p.hit) {
+        stats.recordHits += 1
+        continue
+      }
+      const { title, via } = p.agent.live ? { title: undefined, via: 'live' } : cachedTitleFor(p.header)
+      if (typeof title === 'string') {
+        titles.set(p.id, title)
+        if (via === 'snapshot') stats.snapshot += 1
+        else if (via === 'predecessor') stats.predecessor += 1
+        continue
+      }
+      if (via === 'no-service') stats.noService += 1
+      else if (via === 'miss') stats.miss += 1
+      else if (via.startsWith('error:')) stats.errors[via] = (stats.errors[via] ?? 0) + 1
+      misses.push(p)
+    }
+    if (misses.length > 0) {
+      const folded = await titlesFor(misses.map((p) => p.id))
+      for (const p of misses) {
+        const text = folded.get(p.id)
+        titles.set(p.id, typeof text === 'string' ? text : null)
+      }
+    }
+    stats.batched = misses.length
+    return { titles, stats }
+  }
+
+  /**
+   * 阶段 3：单个会话记录产出（list/preview/list-stream 共用）。
+   * prep（阶段 1）+ titles（阶段 2）已就绪，这里只补体积/mtime 并组装。
+   */
+  async function buildRecord(p, archived, titles) {
+    let title
+    let sizeBytes
+    let mtimeMs
+    if (p.hit) {
+      title = p.cached.title
+      sizeBytes = p.cached.sizeBytes
+      mtimeMs = p.cached.mtimeMs
+    } else {
+      const text = titles.get(p.id)
+      title = typeof text === 'string' ? text : null
+      sizeBytes = p.dir ? await dirSize(p.dir) : 0
+      mtimeMs = p.dir ? await dirMtime(p.dir) : 0
+      if (p.key !== null) recordCache.set(p.id, { key: p.key, title, sizeBytes, mtimeMs })
+      else recordCache.delete(p.id)
+    }
+    return {
+      id: p.id,
+      cwd: p.header.cwd ?? null,
+      createdAt: p.header.createdAt ?? null,
+      origin: p.header.origin ?? null,
+      delegationDepth: p.header.delegationDepth ?? 0,
+      title,
+      archived: archived.has(p.id),
+      live: p.agent.live,
+      running: p.agent.running,
+      sizeBytes,
+      mtimeMs,
+    }
+  }
+
+  /**
+   * 并发池：limit 个 worker 抢占 prep 队列，每个记录算完立即回调 onRecord。
+   * 流式路由据此逐个推送；sessionRecords 据此收集后统一排序。
+   */
+  async function eachRecord(preps, archived, titles, limit, onRecord) {
+    let index = 0
+    const worker = async () => {
+      while (index < preps.length) {
+        const prep = preps[index++]
+        await onRecord(await buildRecord(prep, archived, titles))
+      }
+    }
+    const width = Math.max(1, Math.min(limit, preps.length))
+    await Promise.all(Array.from({ length: width }, () => worker()))
+  }
+
+  /** 会话记录（list/preview 共用）：磁盘 + 归档 + agent 状态 + 占用，mtime 降序。 */
+  async function sessionRecords(ids) {
+    const { byId } = await inventory()
+    const archived = archivedSet()
+    const target = (ids ?? [...byId.keys()]).filter((id) => byId.has(id))
+    const preps = await prepRecords(target, byId)
+    const { titles } = await resolveTitles(preps)
+    const records = []
+    await eachRecord(preps, archived, titles, 16, (record) => {
+      records.push(record)
+    })
+    records.sort((a, b) => b.mtimeMs - a.mtimeMs)
+    return records
+  }
+
+  // -------------------------------------------------------------------------
+  // 删除 / 还原 / 清空
+  // -------------------------------------------------------------------------
+
+  async function deleteSession(id) {
+    if (typeof id !== 'string' || !ID_RE.test(id)) throw httpError(400, 'INVALID_ID', '会话 id 非法')
+    // 条目名在动手之前算好并校验：id 经转义后若仍越界（极端长 id 转义膨胀），
+    // 直接拒绝删除——绝不制造「已归档但没删成」的中间态或不可还原的回收站条目。
+    const entry = `${entryStamp()}-${encodeEntrySegment(id)}`
+    if (!ENTRY_RE.test(entry)) {
+      throw httpError(400, 'INVALID_ID', '会话 id 转义后条目名过长，无法安全移入回收站')
+    }
+    const { byId } = await inventory()
+    const header = byId.get(id)
+    if (header === undefined) throw httpError(404, 'NOT_FOUND', `会话 ${id} 不存在于磁盘记录（可能已删除）`)
+
+    const agent = agentState(id)
+    if (agent.running) throw httpError(409, 'RUNNING', '会话正在运行（模型或子代理未结束），请稍后再试')
+
+    // 归档必须在文件移动之前：官方 sessionKnown 检查 live 或仍在持久化清单。
+    // 已归档是幂等 no-op；此时会话一定 known（上面刚在清单里找到）。
+    try {
+      await ctx.workspaceRegistry.archiveSession(id)
+    } catch (error) {
+      throw httpError(500, 'ARCHIVE_FAILED', `归档失败：${error?.message ?? error}`)
+    }
+
+    const location = ctx.sessionPersistence.locate(header)
+    if (!location || typeof location.path !== 'string') {
+      throw httpError(500, 'UNSUPPORTED', '当前持久化后端无法定位会话目录')
+    }
+    const dir = dirname(location.path)
+    if ((await stat(dir).catch(() => undefined)) === undefined) {
+      // 目录已不存在（例如此前删了一半）：归档已完成，直接视为成功。
+      const keptHidden = archivedSet().has(id)
+      await audit('delete', { id, note: 'dir-missing', keptHidden })
+      // 通知所有客户端从会话列表 store 里移除该行（typert emit 广播；
+      // mock/旧版 ctx 无 emit 时静默跳过）。
+      ctx.emit?.('api-session/removed', id)
+      return { id, ok: true, note: 'dir-missing', keptHidden }
+    }
+    const sizeBytes = await dirSize(dir)
+    // 标题随会话进回收站：缓存优先（清理面板刚读过清单），缺失时单独折叠一次。
+    // 回收站据此显示会话名而非一串 session-id；旧条目无 title 时客户端回退显示 id。
+    let title = null
+    const cachedRec = recordCache.get(id)
+    if (typeof cachedRec?.title === 'string') title = cachedRec.title
+    else {
+      const titles = await titlesFor([id])
+      if (typeof titles.get(id) === 'string') title = titles.get(id)
+    }
+
+    const root = await trashRoot()
+    const entryDir = join(root, entry)
+    const dataDir = join(entryDir, 'data')
+    await mkdir(entryDir, { recursive: true })
+    try {
+      await rename(dir, dataDir)
+    } catch (error) {
+      await rm(entryDir, { recursive: true, force: true }).catch(() => {})
+      throw httpError(500, 'MOVE_FAILED', `移入回收站失败：${error?.message ?? error}`)
+    }
+    await writeFile(
+      join(entryDir, 'meta.json'),
+      JSON.stringify(
+        {
+          id,
+          title,
+          cwd: header.cwd ?? null,
+          trashedAt: new Date().toISOString(),
+          sizeBytes,
+          plugin: 'dsh-archive-manager',
+          version: 1,
+        },
+        null,
+        2,
+      ),
+    )
+    // 文件已离盘。归档 id 保留不摘（见文件头删除流水线第 5 步）：摘除会广播
+    // archived-sessions-changed，把已连接客户端 list store 里的残留行（冷会话）
+    // 或宿主内存里的活会话（live）重新显示回侧栏。ghost 待宿主重启时由
+    // reconcileArchivedGhosts 统一清理。
+    const keptHidden = archivedSet().has(id)
+    await audit('delete', { id, entry, keptHidden })
+    // 关键修复：显式广播 api-session/removed，让 typert 协议把「会话已删除」
+    // 推给所有客户端，客户端据此把残留行从 list store 里剪掉——没有这一步，
+    // 冷会话被删后宿主不发任何帧，行会一直留在侧栏（点开即 session/not-found）。
+    // mock/旧版 ctx 无 emit 时静默跳过（?. 防御）。
+    ctx.emit?.('api-session/removed', id)
+    recordCache.delete(id)
+    return { id, ok: true, entry, keptHidden }
+  }
+
+  async function listTrash() {
+    const root = await trashRoot()
+    let entries
+    try {
+      entries = await readdir(root, { withFileTypes: true })
+    } catch {
+      return []
+    }
+    const items = []
+    for (const entry of entries) {
+      if (!entry.isDirectory() || !ENTRY_RE.test(entry.name)) continue
+      const entryDir = join(root, entry.name)
+      let meta
+      try {
+        meta = JSON.parse(await readFile(join(entryDir, 'meta.json'), 'utf8'))
+      } catch {
+        meta = null
+      }
+      items.push({
+        entry: entry.name,
+        // 真实 id 以 meta.json 为准（原始未转义）；meta 缺失/损坏时的兜底展示
+        // 保留条目名里转义后的片段（~XXXX 原样），仅影响显示不影响寻址。
+        id: typeof meta?.id === 'string' ? meta.id : entry.name.replace(/^\d+-/, ''),
+        title: typeof meta?.title === 'string' && meta.title ? meta.title : null,
+        cwd: typeof meta?.cwd === 'string' ? meta.cwd : null,
+        trashedAt: typeof meta?.trashedAt === 'string' ? meta.trashedAt : null,
+        sizeBytes: await dirSize(join(entryDir, 'data')),
+      })
+    }
+    items.sort((a, b) => String(b.trashedAt ?? '').localeCompare(String(a.trashedAt ?? '')))
+    return items
+  }
+
+  /**
+   * 校验并解析回收站条目路径（restore/purge 共用的唯一入口）。
+   * 除 ENTRY_RE 外还显式拒绝 `.`/`..`（该正则允许它们，join 后会逃出回收站）
+   * 和保留名 audit.log，并要求目标真实存在且是目录——防止把审计日志当条目删除。
+   */
+  async function resolveTrashEntryDir(entry) {
+    if (
+      typeof entry !== 'string' ||
+      !ENTRY_RE.test(entry) ||
+      entry === '.' ||
+      entry === '..' ||
+      entry === AUDIT_LOG
+    ) {
+      throw httpError(400, 'INVALID_ENTRY', '回收站条目名非法')
+    }
+    const dir = join(await trashRoot(), entry)
+    const st = await stat(dir).catch(() => undefined)
+    if (st === undefined) throw httpError(404, 'NOT_FOUND', '回收站条目不存在')
+    if (!st.isDirectory()) throw httpError(400, 'NOT_ENTRY', '回收站条目必须是目录')
+    return dir
+  }
+
+  async function restoreSession(entry) {
+    const entryDir = await resolveTrashEntryDir(entry)
+    const dataDir = join(entryDir, 'data')
+    if ((await stat(dataDir).catch(() => undefined)) === undefined) {
+      throw httpError(404, 'NOT_FOUND', '回收站条目不存在')
+    }
+    let meta
+    try {
+      meta = JSON.parse(await readFile(join(entryDir, 'meta.json'), 'utf8'))
+    } catch {
+      throw httpError(500, 'NO_META', '回收站条目缺少 meta.json，无法还原')
+    }
+    // meta.json 是磁盘文件，可能被篡改；id 过白名单后再交给 locate（纵深防御）。
+    // 会话 id 一律取自 meta.json，绝不从条目名反解——条目名是 encodeEntrySegment
+    // 的转义产物（`~XXXX`），仅作寻址（issue #3 修复约定，勿改成反解条目名）。
+    if (typeof meta?.id !== 'string' || !ID_RE.test(meta.id)) {
+      throw httpError(500, 'BAD_META', '回收站条目 meta.json 中的会话 id 非法')
+    }
+    const location = ctx.sessionPersistence.locate({ id: meta.id, cwd: typeof meta.cwd === 'string' ? meta.cwd : undefined })
+    if (!location || typeof location.path !== 'string') {
+      throw httpError(500, 'UNSUPPORTED', '当前持久化后端无法定位还原目标')
+    }
+    const targetDir = dirname(location.path)
+    if ((await stat(targetDir).catch(() => undefined)) !== undefined) {
+      throw httpError(409, 'EXISTS', '目标位置已存在同名会话目录，未还原')
+    }
+    await mkdir(dirname(targetDir), { recursive: true })
+    await rename(dataDir, targetDir)
+    await rm(entryDir, { recursive: true, force: true }).catch(() => {})
+    // 文件已归位，紧接着在线解除归档：会话直接回到侧栏原分组，一步到位。
+    // 旧版 DSH（无内部状态机）保持旧行为：文件还原、归档态保留，由客户端
+    // 提示离线 unhide 步骤——文件操作永远不因解档失败而回滚。
+    let stillArchived = archivedSet().has(meta.id)
+    if (stillArchived) {
+      try {
+        await unarchiveSession(meta.id)
+      } catch {
+        /* UNSUPPORTED（旧版）或内部失败：归档态保留，走提示路径 */
+      }
+      stillArchived = archivedSet().has(meta.id)
+    }
+    await audit('restore', { id: meta.id, entry, unarchived: !stillArchived })
+    // 删除时已通过 api-session/removed 把该行从客户端 list store 剪掉，这里
+    // 用最小摘要补回（title 由投影缓存/后续 refreshProjections 补齐）。
+    try {
+      const headers = await listHeaders()
+      const header = headers.find((h) => h.id === meta.id)
+      if (header !== undefined) {
+        ctx.emit('api-session/added', {
+          sessionId: meta.id,
+          updatedAt: header.createdAt ?? Date.now(),
+          agentAvailable: false,
+          formatStatus: 'current',
+          running: false,
+          blank: false,
+          ...(header.parentSession === undefined ? {} : { parentSessionId: header.parentSession }),
+          ...(header.origin === undefined ? {} : { origin: header.origin }),
+          ...(header.cwd === undefined ? {} : { cwd: header.cwd }),
+        })
+      }
+    } catch {
+      /* 客户端列表补回失败不影响还原结果 */
+    }
+    recordCache.delete(meta.id)
+    return { id: meta.id, ok: true, stillArchived }
+  }
+
+  async function purge(entry, all) {
+    const root = await trashRoot()
+    if (all) {
+      const items = await listTrash()
+      for (const item of items) await rm(join(root, item.entry), { recursive: true, force: true })
+      // 归档 id 保留不摘（同 delete，见文件头第 5 步）：运行期间摘除会复活
+      // 客户端残留行 / 宿主活会话；ghost 由宿主重启时的 reconcile 统一清理。
+      await audit('purge-all', { count: items.length })
+      return { ok: true, count: items.length }
+    }
+    const entryDir = await resolveTrashEntryDir(entry)
+    let metaId = null
+    try {
+      const meta = JSON.parse(await readFile(join(entryDir, 'meta.json'), 'utf8'))
+      if (typeof meta?.id === 'string' && ID_RE.test(meta.id)) metaId = meta.id
+    } catch {
+      /* meta 缺失/损坏时仍允许清空目录 */
+    }
+    await rm(entryDir, { recursive: true, force: true })
+    // 归档 id 保留不摘（同 delete / purge-all）
+    await audit('purge', { entry, id: metaId })
+    return { ok: true, count: 1 }
+  }
+
+  // -------------------------------------------------------------------------
+  // fork 新增：永久删除 / 自动归档配置与扫描
+  // -------------------------------------------------------------------------
+
+  /** 收集某会话的全部后代（子代理，含多级）会话 id。 */
+  function descendantsOf(byId, rootId) {
+    const out = []
+    const queue = [rootId]
+    const seen = new Set([rootId])
+    while (queue.length > 0) {
+      const current = queue.shift()
+      for (const [id, header] of byId) {
+        if (seen.has(id)) continue
+        if (header !== null && typeof header === 'object' && header.parentSession === current) {
+          seen.add(id)
+          out.push(id)
+          queue.push(id)
+        }
+      }
+    }
+    return out
+  }
+
+  /** 一步永久删除（仿 Codex 侧栏「永久删除」）：归档隐藏 → 直接抹掉目录，跳过回收站。
+   *  全链路：父会话删除时级联抹除其全部子代理会话（多级），逐一广播 removed。 */
+  async function deletePermanent(id) {
+    if (typeof id !== 'string' || !ID_RE.test(id)) throw httpError(400, 'INVALID_ID', '会话 id 非法')
+    const { byId } = await inventory()
+    const header = byId.get(id)
+    if (header === undefined) throw httpError(404, 'NOT_FOUND', `会话 ${id} 不存在于磁盘记录（可能已删除）`)
+    const agent = agentState(id)
+    if (agent.running) throw httpError(409, 'RUNNING', '会话正在运行（模型或子代理未结束），请稍后再试')
+    // 级联目标：全部后代子代理；任何一个在运行都整体拒绝（绝不留下半删状态）
+    const children = descendantsOf(byId, id)
+    const runningChild = children.find((cid) => agentState(cid).running)
+    if (runningChild !== undefined) {
+      throw httpError(409, 'RUNNING', `子代理会话 ${runningChild} 正在运行，请等它结束后再删除`)
+    }
+    const targets = [id, ...children]
+    // 与 deleteSession 相同的簿记顺序：先归档（宿主要求会话仍 known），后动文件。
+    for (const target of targets) {
+      try {
+        await ctx.workspaceRegistry.archiveSession(target)
+      } catch (error) {
+        throw httpError(500, 'ARCHIVE_FAILED', `归档失败：${error?.message ?? error}`)
+      }
+    }
+    let removedDirs = 0
+    for (const target of targets) {
+      const targetHeader = byId.get(target)
+      if (targetHeader === undefined) continue
+      const location = ctx.sessionPersistence.locate(targetHeader)
+      if (!location || typeof location.path !== 'string') continue
+      const dir = dirname(location.path)
+      if ((await stat(dir).catch(() => undefined)) !== undefined) {
+        await rm(dir, { recursive: true, force: true })
+        removedDirs += 1
+      }
+    }
+    for (const target of targets) {
+      ctx.emit?.('api-session/removed', target)
+      recordCache.delete(target)
+    }
+    await audit('delete-permanent', { id, cascade: children.length, removedDirs })
+    return { id, ok: true, cascade: children.length }
+  }
+
+  /**
+   * 自动归档配置。落盘在 <home>/trash/sessions/config.json：该目录可随 DSH_HOME
+   * 迁移，且 purge 不会误伤（listTrash 只列 ENTRY_RE 目录，配置是文件）。
+   */
+  const CONFIG_DEFAULTS = { enabled: false, retentionDays: 7, intervalMinutes: 30 }
+
+  function normalizeConfig(doc) {
+    const out = { ...CONFIG_DEFAULTS }
+    if (doc !== null && typeof doc === 'object') {
+      if (typeof doc.enabled === 'boolean') out.enabled = doc.enabled
+      const days = Number(doc.retentionDays)
+      if (Number.isFinite(days) && days >= 1 && days <= 3650) out.retentionDays = Math.floor(days)
+      const mins = Number(doc.intervalMinutes)
+      if (Number.isFinite(mins) && mins >= 5 && mins <= 10080) out.intervalMinutes = Math.floor(mins)
+    }
+    return out
+  }
+
+  async function loadConfig() {
+    try {
+      const raw = await readFile(join(await trashRoot(), 'config.json'), 'utf8')
+      return normalizeConfig(JSON.parse(raw))
+    } catch {
+      return { ...CONFIG_DEFAULTS }
+    }
+  }
+
+  async function saveConfig(next) {
+    const path = join(await trashRoot(), 'config.json')
+    await mkdir(dirname(path), { recursive: true })
+    await writeFile(path, `${JSON.stringify(next, null, 2)}\n`, 'utf8')
+  }
+
+  /** 置顶会话集合（registry 内部字段名未成契约，多形态探测；取不到则视为无置顶）。 */
+  function pinnedIds() {
+    try {
+      const registry = ctx.workspaceRegistry
+      const state = typeof registry?.requireState === 'function' ? registry.requireState() : null
+      const raw = state?.pinnedSessionIds ?? state?.pinnedSessions ?? []
+      return new Set((Array.isArray(raw) ? raw : []).filter((x) => typeof x === 'string'))
+    } catch {
+      return new Set()
+    }
+  }
+
+  let lastAutoArchiveRun = null
+
+  /**
+   * 自动归档扫描（zcodex 语义）：最后活动时间超过保留期的冷会话 → 官方归档
+   * （只隐藏、不删数据）。置顶与运行中会话不受影响。
+   */
+  async function runAutoArchive(trigger) {
+    const config = await loadConfig()
+    const retentionMs = config.retentionDays * 86_400_000
+    const { byId } = await inventory()
+    const archived = archivedSet()
+    const pinned = pinnedIds()
+    const now = Date.now()
+    const result = {
+      at: new Date().toISOString(),
+      trigger,
+      retentionDays: config.retentionDays,
+      scanned: byId.size,
+      archived: 0,
+      skippedRunning: 0,
+      skippedPinned: 0,
+      skippedArchived: 0,
+      failed: 0,
+      failures: [],
+    }
+    for (const [id, header] of byId) {
+      const agent = agentState(id)
+      if (agent.running) {
+        result.skippedRunning += 1
+        continue
+      }
+      if (archived.has(id)) {
+        result.skippedArchived += 1
+        continue
+      }
+      if (pinned.has(id)) {
+        result.skippedPinned += 1
+        continue
+      }
+      const location = ctx.sessionPersistence.locate(header)
+      const dir = location && typeof location.path === 'string' ? dirname(location.path) : null
+      if (dir === null) continue
+      // 活动时间取日志文件 mtime（追加写只动文件），回退目录 mtime
+      let mtime = 0
+      const logFile = await locateLogFile(dir, location.path)
+      if (logFile !== null) {
+        try {
+          mtime = (await stat(logFile)).mtimeMs
+        } catch {
+          mtime = 0
+        }
+      }
+      if (!mtime) mtime = await dirMtime(dir)
+      if (!mtime || now - mtime < retentionMs) continue
+      try {
+        await ctx.workspaceRegistry.archiveSession(id)
+        result.archived += 1
+        recordCache.delete(id)
+      } catch (error) {
+        result.failed += 1
+        if (result.failures.length < 10) result.failures.push({ id, message: String(error?.message ?? error) })
+      }
+    }
+    lastAutoArchiveRun = result
+    await audit('auto-archive', {
+      trigger,
+      archived: result.archived,
+      skippedRunning: result.skippedRunning,
+      skippedPinned: result.skippedPinned,
+      failed: result.failed,
+    })
+    return result
+  }
+
+  /** 自动归档定时器：配置开关控制；保存配置后重排；插件卸载时清理。 */
+  let autoArchiveTimer = null
+
+  function stopAutoArchiveTimer() {
+    if (autoArchiveTimer !== null) {
+      clearTimeout(autoArchiveTimer)
+      autoArchiveTimer = null
+    }
+  }
+
+  function scheduleAutoArchive() {
+    stopAutoArchiveTimer()
+    loadConfig()
+      .then((config) => {
+        if (!config.enabled) return
+        const tick = async () => {
+          try {
+            await runAutoArchive('timer')
+          } catch {
+            /* 扫描失败不影响下一次调度 */
+          }
+          autoArchiveTimer = setTimeout(tick, config.intervalMinutes * 60_000)
+        }
+        autoArchiveTimer = setTimeout(tick, config.intervalMinutes * 60_000)
+      })
+      .catch(() => {})
+  }
+
+  /** 永久删除全部已归档会话（仿 zcodex「全部永久删除」）：跳过运行中，逐条容错。 */
+  async function purgeArchivedAll() {
+    const { byId } = await inventory()
+    const archived = archivedSet()
+    const targets = [...byId.keys()].filter((id) => archived.has(id))
+    let purged = 0
+    let failed = 0
+    let skippedRunning = 0
+    let freedBytes = 0
+    const failures = []
+    for (const id of targets) {
+      const agent = agentState(id)
+      if (agent.running) {
+        skippedRunning += 1
+        continue
+      }
+      const header = byId.get(id)
+      const location = ctx.sessionPersistence.locate(header)
+      const dir = location && typeof location.path === 'string' ? dirname(location.path) : null
+      try {
+        if (dir !== null && (await stat(dir).catch(() => undefined)) !== undefined) {
+          freedBytes += await dirSize(dir)
+          await rm(dir, { recursive: true, force: true })
+        }
+        purged += 1
+        ctx.emit?.('api-session/removed', id)
+        recordCache.delete(id)
+      } catch (error) {
+        failed += 1
+        if (failures.length < 10) failures.push({ id, message: String(error?.message ?? error) })
+      }
+    }
+    await audit('purge-archived', { count: purged, failed, skippedRunning })
+    return { ok: true, purged, failed, skippedRunning, freedBytes, failures }
+  }
+
+  // -------------------------------------------------------------------------
+  // HTTP 路由
+  // -------------------------------------------------------------------------
+
+  function sendJson(res, status, body) {
+    res.writeHead(status, {
+      'content-type': 'application/json; charset=utf-8',
+      'cache-control': 'no-store',
+    })
+    res.end(JSON.stringify(body))
+  }
+
+  async function readBody(req) {
+    const chunks = []
+    for await (const chunk of req) chunks.push(chunk)
+    const text = Buffer.concat(chunks).toString('utf8')
+    if (!text.trim()) return {}
+    let data
+    try {
+      data = JSON.parse(text)
+    } catch {
+      throw httpError(400, 'INVALID_BODY', '请求体不是合法 JSON')
+    }
+    if (typeof data !== 'object' || data === null || Array.isArray(data)) {
+      throw httpError(400, 'INVALID_BODY', '请求体必须是 JSON 对象')
+    }
+    return data
+  }
+
+  function guard(handler) {
+    return async (req, res) => {
+      try {
+        if (req.method !== 'GET' && req.headers[PLUGIN_HEADER] !== 'session-delete') {
+          throw httpError(403, 'FORBIDDEN', `缺少 ${PLUGIN_HEADER} 头`)
+        }
+        await handler(req, res)
+      } catch (error) {
+        sendJson(res, error?.statusCode ?? 500, {
+          error: { code: error?.code ?? 'INTERNAL', message: String(error?.message ?? error) },
+        })
+      }
+    }
+  }
+
+  /** workspaceRegistry.list() 的稳定投影（/list 与 /list-stream 共用；失败退空）。 */
+  async function workspacesView() {
+    return Promise.resolve()
+      .then(() => ctx.workspaceRegistry.list())
+      .then((list) =>
+        (list ?? []).map((w) => ({
+          workspaceId: String(w.id ?? w.workspaceId ?? ''),
+          title: String(w.title ?? ''),
+          path: String(w.path ?? ''),
+        })),
+      )
+      .catch(() => [])
+  }
+
+  ctx.effect(() =>
+    ctx.webServer.register({
+      kind: 'exact',
+      path: `${PREFIX}/list`,
+      handler: guard(async (req, res) => {
+        if (req.method !== 'GET') return sendJson(res, 405, { error: { code: 'METHOD', message: 'GET only' } })
+        // 运行期间不做 ghost reconcile（见 reconcileArchivedGhosts 注释）。
+        const [sessions, workspaces] = await Promise.all([sessionRecords(), workspacesView()])
+        sendJson(res, 200, {
+          ok: true,
+          sessions,
+          workspaces,
+          archivedCount: sessions.filter((s) => s.archived).length,
+          unarchiveSupported: registryCanUnarchive(),
+        })
+      }),
+    }),
+  )
+
+  /**
+   * 流式全量清单（NDJSON，逐行 JSON 对象 + '\n'）：
+   *   { type: 'meta', total, workspaces, unarchiveSupported }   首行，总数即时可知
+   *   { type: 'session', session }                              每算完一个会话推一行
+   *   { type: 'error', message }                                中途失败（此后仍发 done 收尾）
+   *   { type: 'done' }                                          结束标记
+   * 与一次性 /list 内容同源（buildRecord）；排序交给客户端（mtimeMs 降序），
+   * 服务端流式期间无序产出。会话多时（标题折叠要 zstd 解压整个日志）一次性
+   * /list 首次可达数秒，本路由让客户端从第一行起就显示「已加载 N / M」。
+   * GET 免自定义头（与其它 GET 一致）；行很小（~200B），无需背压处理。
+   */
+  ctx.effect(() =>
+    ctx.webServer.register({
+      kind: 'exact',
+      path: `${PREFIX}/list-stream`,
+      handler: guard(async (req, res) => {
+        if (req.method !== 'GET') return sendJson(res, 405, { error: { code: 'METHOD', message: 'GET only' } })
+        const t0 = Date.now()
+        const { byId } = await inventory()
+        const archived = archivedSet()
+        const ids = [...byId.keys()]
+        const tInv = Date.now()
+        res.writeHead(200, {
+          'content-type': 'application/x-ndjson; charset=utf-8',
+          'cache-control': 'no-store',
+        })
+        const write = (obj) => {
+          if (!res.writableEnded) res.write(`${JSON.stringify(obj)}\n`)
+        }
+        // meta 先行：total 来自 inventory（磁盘清单，快），进度分母即时可知
+        write({ type: 'meta', total: ids.length, workspaces: await workspacesView(), unarchiveSupported: registryCanUnarchive() })
+        // 阶段 1/2：stat 预检 + 标题批量解析（投影缓存命中为主，miss 合批一次
+        // 解压——见 resolveTitles 注释）。此阶段行尚未流出；缓存全热时毫秒级，
+        // 冷缓存全程解压时进度停在 0/N（一次性代价，侧栏预热后不再出现）。
+        let preps = []
+        let titles = new Map()
+        let titleStats = {}
+        try {
+          const tPrep = Date.now()
+          preps = await prepRecords(ids, byId)
+          const tTitle = Date.now()
+          const resolved = await resolveTitles(preps)
+          titles = resolved.titles
+          titleStats = resolved.stats
+          titleStats.prepMs = tTitle - tPrep
+          titleStats.titleMs = Date.now() - tTitle
+        } catch (error) {
+          write({ type: 'error', message: String(error?.message ?? error) })
+        }
+        // 阶段 3：行快速流出（recordCache 命中者纯组装，miss 者补 dirSize）
+        const tRows = Date.now()
+        try {
+          await eachRecord(preps, archived, titles, 16, (record) => write({ type: 'session', session: record }))
+        } catch (error) {
+          write({ type: 'error', message: String(error?.message ?? error) })
+        }
+        // done 行附带阶段耗时与标题来源统计（诊断性能用，客户端可忽略）
+        write({
+          type: 'done',
+          stats: {
+            total: ids.length,
+            inventoryMs: tInv - t0,
+            rowMs: Date.now() - tRows,
+            ...titleStats,
+          },
+        })
+        res.end()
+      }),
+    }),
+  )
+
+  ctx.effect(() =>
+    ctx.webServer.register({
+      kind: 'exact',
+      path: `${PREFIX}/preview`,
+      handler: guard(async (req, res) => {
+        if (req.method !== 'GET') return sendJson(res, 405, { error: { code: 'METHOD', message: 'GET only' } })
+        const id = new URL(req.url ?? '/', 'http://localhost').searchParams.get('id') ?? ''
+        if (!ID_RE.test(id)) return sendJson(res, 400, { error: { code: 'INVALID_ID', message: '会话 id 非法' } })
+        const [record] = await sessionRecords([id])
+        if (record === undefined) {
+          return sendJson(res, 404, { error: { code: 'NOT_FOUND', message: `会话 ${id} 不存在于磁盘记录` } })
+        }
+        sendJson(res, 200, { ok: true, session: record })
+      }),
+    }),
+  )
+
+  ctx.effect(() =>
+    ctx.webServer.register({
+      kind: 'exact',
+      path: `${PREFIX}/delete`,
+      handler: guard(async (req, res) => {
+        if (req.method !== 'POST') return sendJson(res, 405, { error: { code: 'METHOD', message: 'POST only' } })
+        const body = await readBody(req)
+        const result = await deleteSession(body.id)
+        sendJson(res, 200, { ok: true, ...result })
+      }),
+    }),
+  )
+
+  ctx.effect(() =>
+    ctx.webServer.register({
+      kind: 'exact',
+      path: `${PREFIX}/trash`,
+      handler: guard(async (req, res) => {
+        if (req.method !== 'GET') return sendJson(res, 405, { error: { code: 'METHOD', message: 'GET only' } })
+        sendJson(res, 200, { ok: true, items: await listTrash() })
+      }),
+    }),
+  )
+
+  ctx.effect(() =>
+    ctx.webServer.register({
+      kind: 'exact',
+      path: `${PREFIX}/restore`,
+      handler: guard(async (req, res) => {
+        if (req.method !== 'POST') return sendJson(res, 405, { error: { code: 'METHOD', message: 'POST only' } })
+        const body = await readBody(req)
+        const result = await restoreSession(body.entry)
+        sendJson(res, 200, { ok: true, ...result })
+      }),
+    }),
+  )
+
+  ctx.effect(() =>
+    ctx.webServer.register({
+      kind: 'exact',
+      path: `${PREFIX}/unarchive`,
+      handler: guard(async (req, res) => {
+        if (req.method !== 'POST') return sendJson(res, 405, { error: { code: 'METHOD', message: 'POST only' } })
+        const body = await readBody(req)
+        if (typeof body.id !== 'string' || !ID_RE.test(body.id)) {
+          throw httpError(400, 'INVALID_ID', '会话 id 非法')
+        }
+        const changed = await unarchiveSession(body.id)
+        if (changed) await audit('unarchive', { id: body.id })
+        sendJson(res, 200, { ok: true, id: body.id, changed })
+      }),
+    }),
+  )
+
+  ctx.effect(() =>
+    ctx.webServer.register({
+      kind: 'exact',
+      path: `${PREFIX}/purge`,
+      handler: guard(async (req, res) => {
+        if (req.method !== 'POST') return sendJson(res, 405, { error: { code: 'METHOD', message: 'POST only' } })
+        const body = await readBody(req)
+        const result = await purge(body.entry, body.all === true)
+        sendJson(res, 200, { ok: true, ...result })
+      }),
+    }),
+  )
+
+  // ---- fork 新增路由 ----
+
+  ctx.effect(() =>
+    ctx.webServer.register({
+      kind: 'exact',
+      path: `${PREFIX}/delete-permanent`,
+      handler: guard(async (req, res) => {
+        if (req.method !== 'POST') return sendJson(res, 405, { error: { code: 'METHOD', message: 'POST only' } })
+        const body = await readBody(req)
+        const result = await deletePermanent(body.id)
+        sendJson(res, 200, { ok: true, ...result })
+      }),
+    }),
+  )
+
+  ctx.effect(() =>
+    ctx.webServer.register({
+      kind: 'exact',
+      path: `${PREFIX}/config`,
+      handler: guard(async (req, res) => {
+        if (req.method === 'GET') {
+          sendJson(res, 200, { ok: true, config: await loadConfig(), lastRun: lastAutoArchiveRun })
+          return
+        }
+        if (req.method !== 'POST') return sendJson(res, 405, { error: { code: 'METHOD', message: 'GET/POST only' } })
+        const body = await readBody(req)
+        // 补丁语义：与现有配置合并，避免「只提交 enabled 把保留期打回默认」
+        const next = normalizeConfig({ ...(await loadConfig()), ...body })
+        if (body.enabled !== undefined && typeof body.enabled !== 'boolean') {
+          throw httpError(400, 'INVALID_CONFIG', 'enabled 必须是布尔值')
+        }
+        if (body.retentionDays !== undefined) {
+          const days = Number(body.retentionDays)
+          if (!Number.isFinite(days) || days < 1 || days > 3650) {
+            throw httpError(400, 'INVALID_CONFIG', 'retentionDays 必须在 1–3650 之间')
+          }
+        }
+        if (body.intervalMinutes !== undefined) {
+          const mins = Number(body.intervalMinutes)
+          if (!Number.isFinite(mins) || mins < 5 || mins > 10080) {
+            throw httpError(400, 'INVALID_CONFIG', 'intervalMinutes 必须在 5–10080 之间')
+          }
+        }
+        await saveConfig(next)
+        scheduleAutoArchive()
+        sendJson(res, 200, { ok: true, config: next })
+      }),
+    }),
+  )
+
+  ctx.effect(() =>
+    ctx.webServer.register({
+      kind: 'exact',
+      path: `${PREFIX}/auto-archive/run`,
+      handler: guard(async (req, res) => {
+        if (req.method !== 'POST') return sendJson(res, 405, { error: { code: 'METHOD', message: 'POST only' } })
+        await readBody(req)
+        const result = await runAutoArchive('manual')
+        sendJson(res, 200, { ok: true, ...result })
+      }),
+    }),
+  )
+
+  ctx.effect(() =>
+    ctx.webServer.register({
+      kind: 'exact',
+      path: `${PREFIX}/purge-archived`,
+      handler: guard(async (req, res) => {
+        if (req.method !== 'POST') return sendJson(res, 405, { error: { code: 'METHOD', message: 'POST only' } })
+        await readBody(req)
+        const result = await purgeArchivedAll()
+        sendJson(res, 200, result)
+      }),
+    }),
+  )
+
+  // fork：侧边栏注入诊断遥测（客户端钩子上报生命周期/菜单快照，供离线排查）
+  let menuHookDebug = null
+
+  ctx.effect(() =>
+    ctx.webServer.register({
+      kind: 'exact',
+      path: `${PREFIX}/debug`,
+      handler: guard(async (req, res) => {
+        if (req.method === 'GET') {
+          sendJson(res, 200, { ok: true, debug: menuHookDebug })
+          return
+        }
+        if (req.method !== 'POST') return sendJson(res, 405, { error: { code: 'METHOD', message: 'GET/POST only' } })
+        const body = await readBody(req)
+        if (body === null || typeof body !== 'object' || body.state === undefined) {
+          throw httpError(400, 'INVALID_BODY', '缺少 state')
+        }
+        menuHookDebug = { at: new Date().toISOString(), body }
+        sendJson(res, 200, { ok: true })
+      }),
+    }),
+  )
+
+  // 插件卸载/停止时清掉自动归档定时器。
+  ctx.effect(() => stopAutoArchiveTimer, 'session-delete: auto-archive timer cleanup')
+
+  // 宿主重启时 reconcile 一次历史归档 ghost（fire-and-forget）。
+  // 此刻所有客户端都将以全新基线重建 list store，已删会话的行不复存在，
+  // 摘除归档 id 是安全的；运行期间则绝不摘除（详见 reconcileArchivedGhosts）。
+  // inject 保证 workspaceRegistry/sessionPersistence 在 apply 前完成 init，
+  // requireState 此处不会抛 "not started yet"。
+  reconcileArchivedGhosts().catch(() => {})
+  // fork：按已保存的配置恢复自动归档定时扫描。
+  scheduleAutoArchive()
+}
