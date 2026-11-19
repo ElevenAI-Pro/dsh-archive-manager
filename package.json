@@ -13,11 +13,11 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Only-Xwaisw/dsh-archive-manager.git"
+    "url": "git+https://github.com/ElevenAI-Pro/dsh-archive-manager.git"
   },
-  "homepage": "https://github.com/Only-Xwaisw/dsh-archive-manager#readme",
-  "bugs": "https://github.com/Only-Xwaisw/dsh-archive-manager/issues",
-  "author": "Eleven_AI <Only-Xwaisw@users.noreply.github.com>",
+  "homepage": "https://github.com/ElevenAI-Pro/dsh-archive-manager#readme",
+  "bugs": "https://github.com/ElevenAI-Pro/dsh-archive-manager/issues",
+  "author": "Eleven_AI <ElevenAI-Pro@users.noreply.github.com>",
   "exports": {
     ".": "./src/index.js",
     "./client": "./src/client.js",

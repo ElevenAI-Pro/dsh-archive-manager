@@ -38,7 +38,7 @@
 
 ## 四、发布前待办（人工两步）
 
-1. 全局替换 `Only-Xwaisw`（package.json 三处仓库地址）与 `xinshiyi <Only-Xwaisw@users.noreply.github.com>`（author、NOTICE）为你的真实信息。
+1. 全局替换 `ElevenAI-Pro`（package.json 三处仓库地址）与 `xinshiyi <ElevenAI-Pro@users.noreply.github.com>`（author、NOTICE）为你的真实信息。
 2. **如需发布到 npm**：`dsh-session-delete` 这个名字在 npm 上已被占用，必须改名（例如 `dsh-archive-manager` / `dsh-session-cleaner`）；改名时同步修改 `package.json` 的 `name`、`cordis.patch.yml` 的 `insert.name`，并更新 README 安装命令。仅发布 GitHub 源码则无需改名。
 
 ## 五、运行时依赖说明
