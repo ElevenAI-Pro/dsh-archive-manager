@@ -6,7 +6,7 @@
 
 基于 [xohmai/dsh-session-delete](https://github.com/xohmai/dsh-session-delete) 的框架重构（Apache-2.0）。上游版权完整保留，与本 fork 的关系及改动见 [FORK.md](FORK.md)、[NOTICE](NOTICE)。
 
-**作者：**[Only-Xwaisw](https://github.com/Only-Xwaisw)（xinshiyi）
+**作者：**[Eleven_AI](https://github.com/Only-Xwaisw)（xinshiyi）
 
 ## 功能
 

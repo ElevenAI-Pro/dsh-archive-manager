@@ -6,7 +6,7 @@
 
 Built on the framework of [xohmai/dsh-session-delete](https://github.com/xohmai/dsh-session-delete) (Apache-2.0). Upstream copyright fully retained; see [FORK.md](FORK.md) and [NOTICE](NOTICE) for the relationship and changes.
 
-**Author:** [Only-Xwaisw](https://github.com/Only-Xwaisw) · xinshiyi
+**Author:** [Eleven_AI](https://github.com/Only-Xwaisw) · xinshiyi
 
 ## Features
 
