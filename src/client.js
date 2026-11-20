@@ -210,6 +210,14 @@ window.__ModuleLoader__.load({
       },
     }
 
+    /** title 属性槽单行化（T2-07 修复）：会话标题/路径源自磁盘且不在插件白名单内，
+     *  直接拼接 `${title}\n${id}\n${cwd}` 会让 tooltip 展示多行伪造文案（如
+     *  「已永久删除…」冒名提示行）。清洗：折叠 `\r\n\t` 为空格、剪掉行内多余
+     *  连续空格，保留标题语义同时封死换行注入。 */
+    function oneLine(v) {
+      return String(v ?? '').replace(/[\r\n\t]+/g, ' ').replace(/ {2,}/g, ' ')
+    }
+
     /** t 缺席时的兜底翻译（官方 locale 注入失败也能用中文完成确认）。 */
     function menuText(key, params, lang = 'zh') {
       let text = (MENU_DICTS[lang] ?? MENU_DICTS.zh ?? {})[key] ?? key
@@ -574,7 +582,7 @@ window.__ModuleLoader__.load({
           onClose: close,
           closeLabel: t('close'),
           title: t('dialogTitle'),
-          description: t('dialogBody', { title }),
+          description: t('dialogBody', { title: oneLine(title) }),
           footer: h(React.Fragment, null, [
             h(primitives.Button, { key: 'cancel', variant: 'outline', disabled: busy, onClick: close }, t('cancel')),
             h(
@@ -1391,7 +1399,7 @@ window.__ModuleLoader__.load({
             }),
             h(
               'span',
-              { key: 't', style: { fontSize: 13, color: T.label, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1, minWidth: 0 }, title: `${s.title ?? '未命名'}\n${s.id}\n${s.cwd ?? ''}` },
+              { key: 't', style: { fontSize: 13, color: T.label, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1, minWidth: 0 }, title: `${oneLine(s.title ?? '未命名')}\n${s.id}\n${oneLine(s.cwd ?? '')}` },
               s.title || `未命名 · ${shortId(s.id)}`,
             ),
             s.running ? h('span', { key: 'r', style: tagStyle(T.err) }, '运行中') : null,
@@ -1468,7 +1476,7 @@ window.__ModuleLoader__.load({
             }),
             h(
               'span',
-              { key: 't', style: { fontSize: 13, color: T.label, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1, minWidth: 0 }, title: `${it.title ?? ''}\n${it.id}\n${it.cwd ?? ''}` },
+              { key: 't', style: { fontSize: 13, color: T.label, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1, minWidth: 0 }, title: `${oneLine(it.title ?? '')}\n${it.id}\n${oneLine(it.cwd ?? '')}` },
               it.title || it.id,
             ),
             h('span', { key: 'm', title: it.trashedAt ?? '', style: { fontSize: 11, color: T.secondary, flexShrink: 0, width: 64, textAlign: 'right' } }, fmtAgo(it.trashedAt ? Date.parse(it.trashedAt) : 0)),
@@ -1701,7 +1709,7 @@ window.__ModuleLoader__.load({
                     h('div', { key: 'h', className: 'sd-grouphd', onClick: () => toggleGroupOpen(key), title: open ? '点击折叠' : '点击展开' }, [
                       h('span', { key: 'ch', className: 'sd-chev', style: { transform: open ? 'rotate(90deg)' : 'none' } }, svgEl(ICON_PATH_CHEVRON, 14)),
                       h('span', { key: 'fo', style: { display: 'inline-flex', color: T.secondary } }, svgEl(ICON_PATH_FOLDER, 15)),
-                      h('span', { key: 'n', style: { fontSize: 13, fontWeight: 600, color: T.label, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, title: meta.path }, meta.name),
+                      h('span', { key: 'n', style: { fontSize: 13, fontWeight: 600, color: T.label, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, title: oneLine(meta.path) }, meta.name),
                       h('span', { key: 'sp', style: { flex: 1 } }),
                       h('span', { key: 'i', style: { fontSize: 13, color: T.secondary, flexShrink: 0, fontVariantNumeric: 'tabular-nums' } }, `${groupSessions.length} 个会话`),
                     ]),
@@ -1751,7 +1759,7 @@ window.__ModuleLoader__.load({
                         onClick: (e) => e.stopPropagation(),
                         style: { accentColor: T.brand, cursor: 'pointer' },
                       }),
-                      h('span', { key: 'n', style: { fontSize: 12, fontWeight: 600, color: T.secondary, letterSpacing: 0.3, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, title: meta.path }, meta.name),
+                      h('span', { key: 'n', style: { fontSize: 12, fontWeight: 600, color: T.secondary, letterSpacing: 0.3, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, title: oneLine(meta.path) }, meta.name),
                       h('span', { key: 'i', style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary, var(--dsw-alias-label-secondary))', flexShrink: 0 } }, `${groupSessions.length} 会话 · ${fmtSize(groupSessions.reduce((a, s) => a + (s.sizeBytes ?? 0), 0))}`),
                     ]),
                     ...groupSessions.map((s) => sessionRow(s, { indent: true, singleDelete: true, restore: s.archived && unarchiveSupported })),

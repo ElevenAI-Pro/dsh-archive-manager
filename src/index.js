@@ -55,7 +55,7 @@
  *   - 投影缓存 session_projcache.json 中可能残留死条目（无害，重启自愈）。
  *   - 搜索索引（sqlite）按磁盘清单 reconcile，文件消失后自动清行。
  */
-import { appendFile, mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { appendFile, lstat, mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import { homedir } from 'node:os'
 
@@ -104,11 +104,16 @@ function httpError(statusCode, code, message) {
   return Object.assign(new Error(message), { statusCode, code })
 }
 
-/** 递归求目录字节占用；不可读条目按 0 计，不抛错。 */
+/** 递归求目录字节占用；不可读条目按 0 计，不抛错。
+ * T1-08 修复：入口先 lstat 判定，若路径本体是符号链接/junction（顶层被 readdir
+ * 静默分解、dirSize 会穿透计量外域字节，见 `evid_T1_junction_probe.mjs` A2=800B）
+ * 则拒绝计量直接返回 0——真实会话目录永远是普通目录，此分支仅命中链接攻击面。 */
 async function dirSize(path) {
   let total = 0
   let entries
   try {
+    const info = await lstat(path)
+    if (info.isSymbolicLink()) return 0
     entries = await readdir(path, { withFileTypes: true })
   } catch {
     return 0
@@ -125,6 +130,20 @@ async function dirSize(path) {
     }
   }
   return total
+}
+
+/** T1-08：判定「真实目录」——存在、是目录、且不是符号链接/junction。
+ * 旧实现用 stat() 会跟随链接：会话目录本体被换成 junction 时会被当成真实目录
+ * 继续 move/rm/计数（计量穿透见 dirSize），本判定让所有「这是会话数据目录吗」
+ * 的门禁一致拒绝链接，堵死利用面（删除动作在 Node≥14.14 只删链接本体，但
+ * 残留链接条目 + 误导计量仍有价值）。 */
+async function isRealDir(path) {
+  try {
+    const info = await lstat(path)
+    return info.isDirectory() && !info.isSymbolicLink()
+  } catch {
+    return false
+  }
 }
 
 async function dirMtime(path) {
@@ -609,7 +628,7 @@ export function apply(ctx) {
       throw httpError(500, 'UNSUPPORTED', '当前持久化后端无法定位会话目录')
     }
     const dir = dirname(location.path)
-    if ((await stat(dir).catch(() => undefined)) === undefined) return null
+    if (!(await isRealDir(dir))) return null
     const sizeBytes = await dirSize(dir)
     const root = await trashRoot()
     const entryDir = join(root, entry)
@@ -680,7 +699,7 @@ export function apply(ctx) {
           return null
         }
       })()
-      if (dir === null || (await stat(dir).catch(() => undefined)) === undefined) continue
+      if (dir === null || !(await isRealDir(dir))) continue
       const cached = recordCache.get(tid)
       const title = typeof cached?.title === 'string' ? cached.title : typeof folded.get(tid) === 'string' ? folded.get(tid) : null
       entries.push({ id: tid, ...(await moveOneToTrash(tid, h, title)) })
@@ -744,16 +763,16 @@ export function apply(ctx) {
       throw httpError(400, 'INVALID_ENTRY', '回收站条目名非法')
     }
     const dir = join(await trashRoot(), entry)
-    const st = await stat(dir).catch(() => undefined)
+    const st = await lstat(dir).catch(() => undefined)
     if (st === undefined) throw httpError(404, 'NOT_FOUND', '回收站条目不存在')
-    if (!st.isDirectory()) throw httpError(400, 'NOT_ENTRY', '回收站条目必须是目录')
+    if (!st.isDirectory() || st.isSymbolicLink()) throw httpError(400, 'NOT_ENTRY', '回收站条目必须是真实目录')
     return dir
   }
 
   async function restoreSession(entry) {
     const entryDir = await resolveTrashEntryDir(entry)
     const dataDir = join(entryDir, 'data')
-    if ((await stat(dataDir).catch(() => undefined)) === undefined) {
+    if (!(await isRealDir(dataDir))) {
       throw httpError(404, 'NOT_FOUND', '回收站条目不存在')
     }
     let meta
@@ -895,7 +914,7 @@ export function apply(ctx) {
       const location = ctx.sessionPersistence.locate(targetHeader)
       if (!location || typeof location.path !== 'string') continue
       const dir = dirname(location.path)
-      if ((await stat(dir).catch(() => undefined)) !== undefined) {
+      if (await isRealDir(dir)) {
         await rm(dir, { recursive: true, force: true })
         removedDirs += 1
       }
@@ -1083,7 +1102,7 @@ export function apply(ctx) {
       const location = ctx.sessionPersistence.locate(header)
       const dir = location && typeof location.path === 'string' ? dirname(location.path) : null
       try {
-        if (dir !== null && (await stat(dir).catch(() => undefined)) !== undefined) {
+        if (dir !== null && (await isRealDir(dir))) {
           freedBytes += await dirSize(dir)
           await rm(dir, { recursive: true, force: true })
         }
