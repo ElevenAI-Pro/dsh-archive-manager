@@ -34,6 +34,12 @@
 ## 安装
 
 ```sh
+dsh plugin --profile <your-profile> add dsh-archive-management
+```
+
+或直接从 GitHub 仓库安装：
+
+```sh
 dsh plugin --profile <your-profile> add github:ElevenAI-Pro/dsh-archive-manager
 ```
 

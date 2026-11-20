@@ -1,5 +1,5 @@
 /**
- * dsh-archive-manager — Host half.
+ * dsh-archive-management — Host half.
  *
  * 本机 HTTP 路由（loopback，Cache-Control: no-store；非 GET 要求自定义头
  * `x-dsh-plugin: session-delete` 作最低限度 CSRF 防线——自定义头跨域必触发
@@ -598,60 +598,24 @@ export function apply(ctx) {
   // 删除 / 还原 / 清空
   // -------------------------------------------------------------------------
 
-  async function deleteSession(id) {
-    if (typeof id !== 'string' || !ID_RE.test(id)) throw httpError(400, 'INVALID_ID', '会话 id 非法')
-    // 条目名在动手之前算好并校验：id 经转义后若仍越界（极端长 id 转义膨胀），
-    // 直接拒绝删除——绝不制造「已归档但没删成」的中间态或不可还原的回收站条目。
+  /** 单会话移入回收站：定位 → 条目名校验 → rename → meta.json。返回 { entry, sizeBytes }。 */
+  async function moveOneToTrash(id, header, title) {
     const entry = `${entryStamp()}-${encodeEntrySegment(id)}`
     if (!ENTRY_RE.test(entry)) {
       throw httpError(400, 'INVALID_ID', '会话 id 转义后条目名过长，无法安全移入回收站')
     }
-    const { byId } = await inventory()
-    const header = byId.get(id)
-    if (header === undefined) throw httpError(404, 'NOT_FOUND', `会话 ${id} 不存在于磁盘记录（可能已删除）`)
-
-    const agent = agentState(id)
-    if (agent.running) throw httpError(409, 'RUNNING', '会话正在运行（模型或子代理未结束），请稍后再试')
-
-    // 归档必须在文件移动之前：官方 sessionKnown 检查 live 或仍在持久化清单。
-    // 已归档是幂等 no-op；此时会话一定 known（上面刚在清单里找到）。
-    try {
-      await ctx.workspaceRegistry.archiveSession(id)
-    } catch (error) {
-      throw httpError(500, 'ARCHIVE_FAILED', `归档失败：${error?.message ?? error}`)
-    }
-
     const location = ctx.sessionPersistence.locate(header)
     if (!location || typeof location.path !== 'string') {
       throw httpError(500, 'UNSUPPORTED', '当前持久化后端无法定位会话目录')
     }
     const dir = dirname(location.path)
-    if ((await stat(dir).catch(() => undefined)) === undefined) {
-      // 目录已不存在（例如此前删了一半）：归档已完成，直接视为成功。
-      const keptHidden = archivedSet().has(id)
-      await audit('delete', { id, note: 'dir-missing', keptHidden })
-      // 通知所有客户端从会话列表 store 里移除该行（typert emit 广播；
-      // mock/旧版 ctx 无 emit 时静默跳过）。
-      ctx.emit?.('api-session/removed', id)
-      return { id, ok: true, note: 'dir-missing', keptHidden }
-    }
+    if ((await stat(dir).catch(() => undefined)) === undefined) return null
     const sizeBytes = await dirSize(dir)
-    // 标题随会话进回收站：缓存优先（清理面板刚读过清单），缺失时单独折叠一次。
-    // 回收站据此显示会话名而非一串 session-id；旧条目无 title 时客户端回退显示 id。
-    let title = null
-    const cachedRec = recordCache.get(id)
-    if (typeof cachedRec?.title === 'string') title = cachedRec.title
-    else {
-      const titles = await titlesFor([id])
-      if (typeof titles.get(id) === 'string') title = titles.get(id)
-    }
-
     const root = await trashRoot()
     const entryDir = join(root, entry)
-    const dataDir = join(entryDir, 'data')
     await mkdir(entryDir, { recursive: true })
     try {
-      await rename(dir, dataDir)
+      await rename(dir, join(entryDir, 'data'))
     } catch (error) {
       await rm(entryDir, { recursive: true, force: true }).catch(() => {})
       throw httpError(500, 'MOVE_FAILED', `移入回收站失败：${error?.message ?? error}`)
@@ -665,26 +629,70 @@ export function apply(ctx) {
           cwd: header.cwd ?? null,
           trashedAt: new Date().toISOString(),
           sizeBytes,
-          plugin: 'dsh-archive-manager',
+          plugin: 'dsh-archive-management',
           version: 1,
         },
         null,
         2,
       ),
     )
-    // 文件已离盘。归档 id 保留不摘（见文件头删除流水线第 5 步）：摘除会广播
-    // archived-sessions-changed，把已连接客户端 list store 里的残留行（冷会话）
-    // 或宿主内存里的活会话（live）重新显示回侧栏。ghost 待宿主重启时由
-    // reconcileArchivedGhosts 统一清理。
+    return { entry, sizeBytes }
+  }
+
+  async function deleteSession(id) {
+    if (typeof id !== 'string' || !ID_RE.test(id)) throw httpError(400, 'INVALID_ID', '会话 id 非法')
+    const { byId } = await inventory()
+    const header = byId.get(id)
+    if (header === undefined) throw httpError(404, 'NOT_FOUND', `会话 ${id} 不存在于磁盘记录（可能已删除）`)
+    // fork P0：级联目标 = 全部后代子代理（多级）。任何一个在运行都整体拒绝——绝不半删。
+    const children = descendantsOf(byId, id)
+    const targets = [id, ...children]
+    const runningTarget = targets.find((tid) => agentState(tid).running)
+    if (runningTarget !== undefined) {
+      throw httpError(
+        409,
+        'RUNNING',
+        runningTarget === id
+          ? '会话正在运行（模型或子代理未结束），请稍后再试'
+          : `子代理会话 ${runningTarget} 正在运行，请等它结束后再删除`,
+      )
+    }
+    // 归档必须在文件移动之前：官方 sessionKnown 检查 live 或仍在持久化清单。
+    // 已归档是幂等 no-op；此时会话一定 known（上面刚在清单里找到）。
+    for (const tid of targets) {
+      try {
+        await ctx.workspaceRegistry.archiveSession(tid)
+      } catch (error) {
+        throw httpError(500, 'ARCHIVE_FAILED', `归档失败：${error?.message ?? error}`)
+      }
+    }
+    // 标题批量解析一次（父 + 全部子代理）：缓存优先，缺失合批折叠。
+    const folded = await titlesFor(targets)
+    const root = await trashRoot()
+    const entries = []
+    for (const tid of targets) {
+      const h = byId.get(tid)
+      const dir = (() => {
+        try {
+          const location = ctx.sessionPersistence.locate(h)
+          return location && typeof location.path === 'string' ? dirname(location.path) : null
+        } catch {
+          return null
+        }
+      })()
+      if (dir === null || (await stat(dir).catch(() => undefined)) === undefined) continue
+      const cached = recordCache.get(tid)
+      const title = typeof cached?.title === 'string' ? cached.title : typeof folded.get(tid) === 'string' ? folded.get(tid) : null
+      entries.push({ id: tid, ...(await moveOneToTrash(tid, h, title)) })
+    }
+    for (const tid of targets) {
+      ctx.emit?.('api-session/removed', tid)
+      recordCache.delete(tid)
+    }
+    // 归档 id 保留不摘（ghost 待宿主重启 reconcile 统一清理，见文件头第 5 步）。
     const keptHidden = archivedSet().has(id)
-    await audit('delete', { id, entry, keptHidden })
-    // 关键修复：显式广播 api-session/removed，让 typert 协议把「会话已删除」
-    // 推给所有客户端，客户端据此把残留行从 list store 里剪掉——没有这一步，
-    // 冷会话被删后宿主不发任何帧，行会一直留在侧栏（点开即 session/not-found）。
-    // mock/旧版 ctx 无 emit 时静默跳过（?. 防御）。
-    ctx.emit?.('api-session/removed', id)
-    recordCache.delete(id)
-    return { id, ok: true, entry, keptHidden }
+    await audit('delete', { id, cascade: children.length, entries: entries.map((e) => e.entry), keptHidden })
+    return { id, ok: true, entry: (entries.find((e) => e.id === id) ?? {}).entry, cascade: children.length, keptHidden }
   }
 
   async function listTrash() {
@@ -930,7 +938,10 @@ export function apply(ctx) {
   async function saveConfig(next) {
     const path = join(await trashRoot(), 'config.json')
     await mkdir(dirname(path), { recursive: true })
-    await writeFile(path, `${JSON.stringify(next, null, 2)}\n`, 'utf8')
+    // fork P0：原子写——临时文件 + rename，杜绝写一半崩溃导致配置损坏
+    const tmp = `${path}.tmp`
+    await writeFile(tmp, `${JSON.stringify(next, null, 2)}\n`, 'utf8')
+    await rename(tmp, path)
   }
 
   /** 置顶会话集合（registry 内部字段名未成契约，多形态探测；取不到则视为无置顶）。 */
@@ -1047,11 +1058,16 @@ export function apply(ctx) {
       .catch(() => {})
   }
 
-  /** 永久删除全部已归档会话（仿 zcodex「全部永久删除」）：跳过运行中，逐条容错。 */
+  /** 永久删除全部已归档会话（仿 zcodex「全部永久删除」）：跳过运行中，逐条容错。
+   *  fork P0：级联目标包含已归档会话的全部后代子代理——不留孤儿。 */
   async function purgeArchivedAll() {
     const { byId } = await inventory()
     const archived = archivedSet()
-    const targets = [...byId.keys()].filter((id) => archived.has(id))
+    const targets = new Set()
+    for (const id of [...byId.keys()].filter((x) => archived.has(x))) {
+      targets.add(id)
+      for (const d of descendantsOf(byId, id)) targets.add(d)
+    }
     let purged = 0
     let failed = 0
     let skippedRunning = 0
@@ -1398,18 +1414,28 @@ export function apply(ctx) {
     ctx.webServer.register({
       kind: 'exact',
       path: `${PREFIX}/debug`,
-      handler: guard(async (req, res) => {
-        if (req.method === 'GET') {
-          sendJson(res, 200, { ok: true, debug: menuHookDebug })
-          return
+      handler: (async (req, res) => {
+        try {
+          // fork P0：遥测可能包含菜单结构快照——所有方法（含 GET）都要求自定义头
+          if (req.headers[PLUGIN_HEADER] !== 'session-delete') {
+            throw httpError(403, 'FORBIDDEN', `缺少 ${PLUGIN_HEADER} 头`)
+          }
+          if (req.method === 'GET') {
+            sendJson(res, 200, { ok: true, debug: menuHookDebug })
+            return
+          }
+          if (req.method !== 'POST') return sendJson(res, 405, { error: { code: 'METHOD', message: 'GET/POST only' } })
+          const body = await readBody(req)
+          if (body === null || typeof body !== 'object' || body.state === undefined) {
+            throw httpError(400, 'INVALID_BODY', '缺少 state')
+          }
+          menuHookDebug = { at: new Date().toISOString(), body }
+          sendJson(res, 200, { ok: true })
+        } catch (error) {
+          sendJson(res, error?.statusCode ?? 500, {
+            error: { code: error?.code ?? 'INTERNAL', message: String(error?.message ?? error) },
+          })
         }
-        if (req.method !== 'POST') return sendJson(res, 405, { error: { code: 'METHOD', message: 'GET/POST only' } })
-        const body = await readBody(req)
-        if (body === null || typeof body !== 'object' || body.state === undefined) {
-          throw httpError(400, 'INVALID_BODY', '缺少 state')
-        }
-        menuHookDebug = { at: new Date().toISOString(), body }
-        sendJson(res, 200, { ok: true })
       }),
     }),
   )

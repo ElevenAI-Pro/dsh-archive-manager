@@ -84,6 +84,11 @@ const ctx = {
       archivedCalls.push(id)
       if (!state.archivedSessionIds.includes(id)) state.archivedSessionIds.push(id)
     },
+    unarchiveSession: async (id) => {
+      // 原地移除（保持数组引用稳定，mock 内部状态一致）
+      const idx = state.archivedSessionIds.indexOf(id)
+      if (idx !== -1) state.archivedSessionIds.splice(idx, 1)
+    },
     list: () => [],
     get: () => undefined,
     requireState: () => state,
@@ -182,6 +187,44 @@ expectRoutes()
   check('delete-permanent running -> 409', run.status === 409 && run.body.error.code === 'RUNNING', run)
   const audit = readFileSync(join(home, 'trash', 'sessions', 'audit.log'), 'utf8')
   check('audit has delete-permanent', audit.includes('"action":"delete-permanent"'))
+}
+
+// ---- /delete 软删除级联（fork：子代理跟随进回收站，可独立还原）----
+{
+  const P = 'session-softp001'
+  const C = 'session-softc001'
+  const dirP = makeSession(P)
+  const dirC = makeSession(C, { parentSession: P })
+  const r = await call('/api/session-delete/delete', { method: 'POST', body: { id: P } })
+  check('soft delete parent cascades -> 200', r.status === 200 && r.body.ok === true && r.body.cascade === 1, r)
+  check('soft delete removed both dirs', !existsSync(dirP) && !existsSync(dirC))
+  const trashAfter = await call('/api/session-delete/trash')
+  check('trash holds parent+child entries', trashAfter.status === 200 && trashAfter.body.items.some((i) => i.id === P) && trashAfter.body.items.some((i) => i.id === C), trashAfter.body)
+  const parentEntry = trashAfter.body.items.find((i) => i.id === P).entry
+  const rs = await call('/api/session-delete/restore', { method: 'POST', body: { entry: parentEntry } })
+  check('restore parent -> 200', rs.status === 200 && rs.body.ok === true, rs)
+  check('parent dir restored', existsSync(join(home, 'sessions', 'proj', P, 'session.v3.jsonl.zstd')))
+  const dp = await call('/api/session-delete/delete-permanent', { method: 'POST', body: { id: P } })
+  check('cleanup: restored parent permanently deleted -> 200', dp.status === 200, dp)
+}
+{
+  const P4 = 'session-softp401'
+  const C4 = 'session-softc401'
+  makeSession(P4, { ageDays: 1 })
+  makeSession(C4, { ageDays: 1, parentSession: P4 })
+  runningSet.add(C4)
+  const refused = await call('/api/session-delete/delete', { method: 'POST', body: { id: P4 } })
+  check('soft delete refuses running child -> 409', refused.status === 409 && refused.body.error.code === 'RUNNING', refused)
+  check('refusal leaves dirs untouched', existsSync(join(home, 'sessions', 'proj', P4)) && existsSync(join(home, 'sessions', 'proj', C4)))
+  runningSet.delete(C4)
+}
+
+// ---- /debug 访问控制（fork P0）----
+{
+  const noH = await call('/api/session-delete/debug', { withHeader: false })
+  check('GET /debug without header -> 403', noH.status === 403, noH)
+  const withH = await call('/api/session-delete/debug', { withHeader: true })
+  check('GET /debug with header -> 200', withH.status === 200 && withH.body.ok === true, withH)
 }
 
 // ---- /delete-permanent cascade（子代理级联，fork 全链路）----

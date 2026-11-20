@@ -34,6 +34,12 @@ Built on the framework of [xohmai/dsh-session-delete](https://github.com/xohmai/
 ## Install
 
 ```sh
+dsh plugin --profile <your-profile> add dsh-archive-management
+```
+
+Or install from this GitHub repository directly:
+
+```sh
 dsh plugin --profile <your-profile> add github:ElevenAI-Pro/dsh-archive-manager
 ```
 

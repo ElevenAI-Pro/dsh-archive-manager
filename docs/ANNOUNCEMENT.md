@@ -32,8 +32,10 @@
 ### 安装
 
 ```sh
-dsh plugin --profile <your-profile> add github:YOUR_ACCOUNT/dsh-archive-manager
+dsh plugin --profile <your-profile> add dsh-archive-management
 ```
+
+GitHub 源码安装：`github:ElevenAI-Pro/dsh-archive-manager`
 
 （附 2–3 张截图：①侧栏菜单里的「永久删除」②确认框 ③归档管理页）
 

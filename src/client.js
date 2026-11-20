@@ -1,5 +1,5 @@
 /**
- * dsh-archive-manager — Client half.
+ * dsh-archive-management — Client half.
  *
  * 手写 __ModuleLoader__ 包壳（与 tsdown 产物同构），零构建步骤。
  * 槽位：
@@ -17,7 +17,7 @@
  * 经 workspaces.startSession() 切到同工作区空白会话，UI 不悬空。
  */
 window.__ModuleLoader__.load({
-  id: 'dsh-archive-manager',
+  id: 'dsh-archive-management',
   factory: (require) => {
     const module = { exports: {} }
     const exports = module.exports
@@ -244,7 +244,7 @@ window.__ModuleLoader__.load({
         try {
           listener()
         } catch (error) {
-          console.error('[dsh-archive-manager] pending listener', error)
+          console.error('[dsh-archive-management] pending listener', error)
         }
       }
     }
@@ -484,7 +484,7 @@ window.__ModuleLoader__.load({
         container.setAttribute('data-sd-permanent', '1')
         lastInjectedKey = key
         debugNote('injected below archive (no shortcut, single row)', capturedRow.id)
-        console.log('[dsh-archive-manager] 永久删除已注入会话菜单（无快捷键）：', capturedRow.id)
+        console.log('[dsh-archive-management] 永久删除已注入会话菜单（无快捷键）：', capturedRow.id)
       }
 
       function activate(event) {
@@ -1983,7 +1983,7 @@ window.__ModuleLoader__.load({
         return { error }
       }
       componentDidCatch(error) {
-        console.error('[dsh-archive-manager] 设置页渲染失败:', error)
+        console.error('[dsh-archive-management] 设置页渲染失败:', error)
       }
       render() {
         if (this.state.error !== null) {
@@ -2027,7 +2027,7 @@ window.__ModuleLoader__.load({
       clientCtx = ctx
       ctx.effect(() => {
         const el = document.createElement('style')
-        el.id = 'dsh-archive-manager-styles'
+        el.id = 'dsh-archive-management-styles'
         el.textContent = CSS
         document.head.appendChild(el)
         return () => el.remove()
@@ -2071,16 +2071,16 @@ window.__ModuleLoader__.load({
       try {
         ctx.effect(() => startSidebarMenuHook(langId), 'session-delete: sidebar menu dom hook')
       } catch (error) {
-        console.warn('[dsh-archive-manager] sidebar hook failed:', error)
+        console.warn('[dsh-archive-management] sidebar hook failed:', error)
       }
       const overlayReady = primitives !== null && primitives.Modal !== undefined && primitives.Button !== undefined
       if (!overlayReady) {
-        console.warn('[dsh-archive-manager] Modal/Button primitives unavailable, confirm dialog disabled')
+        console.warn('[dsh-archive-management] Modal/Button primitives unavailable, confirm dialog disabled')
       } else {
         try {
           ctx.effect(() => ctx.locale.register(SD_NS, MENU_DICTS), 'session-delete: menu locale')
         } catch (error) {
-          console.warn('[dsh-archive-manager] locale register failed:', error)
+          console.warn('[dsh-archive-management] locale register failed:', error)
         }
         try {
           ctx.slots.inject('shell.overlay', () =>
@@ -2093,7 +2093,7 @@ window.__ModuleLoader__.load({
             'session-delete: pending cleanup',
           )
         } catch (error) {
-          console.warn('[dsh-archive-manager] overlay register failed:', error)
+          console.warn('[dsh-archive-management] overlay register failed:', error)
         }
       }
     }
