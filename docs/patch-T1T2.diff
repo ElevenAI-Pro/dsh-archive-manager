@@ -1,0 +1,171 @@
+diff --git a/src/index.js b/src/index.js
+index 7647b02..977ce8f 100644
+--- a/src/index.js
++++ b/src/index.js
+@@ -55,7 +55,7 @@
+  *   - 投影缓存 session_projcache.json 中可能残留死条目（无害，重启自愈）。
+  *   - 搜索索引（sqlite）按磁盘清单 reconcile，文件消失后自动清行。
+  */
+-import { appendFile, mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
++import { appendFile, lstat, mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
+ import { dirname, join, resolve } from 'node:path'
+ import { homedir } from 'node:os'
+ 
+@@ -104,11 +104,16 @@ function httpError(statusCode, code, message) {
+   return Object.assign(new Error(message), { statusCode, code })
+ }
+ 
+-/** 递归求目录字节占用；不可读条目按 0 计，不抛错。 */
++/** 递归求目录字节占用；不可读条目按 0 计，不抛错。
++ * T1-08 修复：入口先 lstat 判定，若路径本体是符号链接/junction（顶层被 readdir
++ * 静默分解、dirSize 会穿透计量外域字节，见 `evid_T1_junction_probe.mjs` A2=800B）
++ * 则拒绝计量直接返回 0——真实会话目录永远是普通目录，此分支仅命中链接攻击面。 */
+ async function dirSize(path) {
+   let total = 0
+   let entries
+   try {
++    const info = await lstat(path)
++    if (info.isSymbolicLink()) return 0
+     entries = await readdir(path, { withFileTypes: true })
+   } catch {
+     return 0
+@@ -127,6 +132,20 @@ async function dirSize(path) {
+   return total
+ }
+ 
++/** T1-08：判定「真实目录」——存在、是目录、且不是符号链接/junction。
++ * 旧实现用 stat() 会跟随链接：会话目录本体被换成 junction 时会被当成真实目录
++ * 继续 move/rm/计数（计量穿透见 dirSize），本判定让所有「这是会话数据目录吗」
++ * 的门禁一致拒绝链接，堵死利用面（删除动作在 Node≥14.14 只删链接本体，但
++ * 残留链接条目 + 误导计量仍有价值）。 */
++async function isRealDir(path) {
++  try {
++    const info = await lstat(path)
++    return info.isDirectory() && !info.isSymbolicLink()
++  } catch {
++    return false
++  }
++}
++
+ async function dirMtime(path) {
+   try {
+     return (await stat(path)).mtimeMs
+@@ -609,7 +628,7 @@ export function apply(ctx) {
+       throw httpError(500, 'UNSUPPORTED', '当前持久化后端无法定位会话目录')
+     }
+     const dir = dirname(location.path)
+-    if ((await stat(dir).catch(() => undefined)) === undefined) return null
++    if (!(await isRealDir(dir))) return null
+     const sizeBytes = await dirSize(dir)
+     const root = await trashRoot()
+     const entryDir = join(root, entry)
+@@ -680,7 +699,7 @@ export function apply(ctx) {
+           return null
+         }
+       })()
+-      if (dir === null || (await stat(dir).catch(() => undefined)) === undefined) continue
++      if (dir === null || !(await isRealDir(dir))) continue
+       const cached = recordCache.get(tid)
+       const title = typeof cached?.title === 'string' ? cached.title : typeof folded.get(tid) === 'string' ? folded.get(tid) : null
+       entries.push({ id: tid, ...(await moveOneToTrash(tid, h, title)) })
+@@ -744,16 +763,16 @@ export function apply(ctx) {
+       throw httpError(400, 'INVALID_ENTRY', '回收站条目名非法')
+     }
+     const dir = join(await trashRoot(), entry)
+-    const st = await stat(dir).catch(() => undefined)
++    const st = await lstat(dir).catch(() => undefined)
+     if (st === undefined) throw httpError(404, 'NOT_FOUND', '回收站条目不存在')
+-    if (!st.isDirectory()) throw httpError(400, 'NOT_ENTRY', '回收站条目必须是目录')
++    if (!st.isDirectory() || st.isSymbolicLink()) throw httpError(400, 'NOT_ENTRY', '回收站条目必须是真实目录')
+     return dir
+   }
+ 
+   async function restoreSession(entry) {
+     const entryDir = await resolveTrashEntryDir(entry)
+     const dataDir = join(entryDir, 'data')
+-    if ((await stat(dataDir).catch(() => undefined)) === undefined) {
++    if (!(await isRealDir(dataDir))) {
+       throw httpError(404, 'NOT_FOUND', '回收站条目不存在')
+     }
+     let meta
+@@ -895,7 +914,7 @@ export function apply(ctx) {
+       const location = ctx.sessionPersistence.locate(targetHeader)
+       if (!location || typeof location.path !== 'string') continue
+       const dir = dirname(location.path)
+-      if ((await stat(dir).catch(() => undefined)) !== undefined) {
++      if (await isRealDir(dir)) {
+         await rm(dir, { recursive: true, force: true })
+         removedDirs += 1
+       }
+@@ -1083,7 +1102,7 @@ export function apply(ctx) {
+       const location = ctx.sessionPersistence.locate(header)
+       const dir = location && typeof location.path === 'string' ? dirname(location.path) : null
+       try {
+-        if (dir !== null && (await stat(dir).catch(() => undefined)) !== undefined) {
++        if (dir !== null && (await isRealDir(dir))) {
+           freedBytes += await dirSize(dir)
+           await rm(dir, { recursive: true, force: true })
+         }
+index 4abc2da..85e880c 100644
+--- a/src/client.js
++++ b/src/client.js
+@@ -210,6 +210,14 @@ window.__ModuleLoader__.load({
+       },
+     }
+ 
++    /** title 属性槽单行化（T2-07 修复）：会话标题/路径源自磁盘且不在插件白名单内，
++     *  直接拼接 `${title}\n${id}\n${cwd}` 会让 tooltip 展示多行伪造文案（如
++     *  「已永久删除…」冒名提示行）。清洗：折叠 `\r\n\t` 为空格、剪掉行内多余
++     *  连续空格，保留标题语义同时封死换行注入。 */
++    function oneLine(v) {
++      return String(v ?? '').replace(/[\r\n\t]+/g, ' ').replace(/ {2,}/g, ' ')
++    }
++
+     /** t 缺席时的兜底翻译（官方 locale 注入失败也能用中文完成确认）。 */
+     function menuText(key, params, lang = 'zh') {
+       let text = (MENU_DICTS[lang] ?? MENU_DICTS.zh ?? {})[key] ?? key
+@@ -574,7 +582,7 @@ window.__ModuleLoader__.load({
+           onClose: close,
+           closeLabel: t('close'),
+           title: t('dialogTitle'),
+-          description: t('dialogBody', { title }),
++          description: t('dialogBody', { title: oneLine(title) }),
+           footer: h(React.Fragment, null, [
+             h(primitives.Button, { key: 'cancel', variant: 'outline', disabled: busy, onClick: close }, t('cancel')),
+             h(
+@@ -1391,7 +1399,7 @@ window.__ModuleLoader__.load({
+             }),
+             h(
+               'span',
+-              { key: 't', style: { fontSize: 13, color: T.label, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1, minWidth: 0 }, title: `${s.title ?? '未命名'}\n${s.id}\n${s.cwd ?? ''}` },
++              { key: 't', style: { fontSize: 13, color: T.label, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1, minWidth: 0 }, title: `${oneLine(s.title ?? '未命名')}\n${s.id}\n${oneLine(s.cwd ?? '')}` },
+               s.title || `未命名 · ${shortId(s.id)}`,
+             ),
+             s.running ? h('span', { key: 'r', style: tagStyle(T.err) }, '运行中') : null,
+@@ -1468,7 +1476,7 @@ window.__ModuleLoader__.load({
+             }),
+             h(
+               'span',
+-              { key: 't', style: { fontSize: 13, color: T.label, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1, minWidth: 0 }, title: `${it.title ?? ''}\n${it.id}\n${it.cwd ?? ''}` },
++              { key: 't', style: { fontSize: 13, color: T.label, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1, minWidth: 0 }, title: `${oneLine(it.title ?? '')}\n${it.id}\n${oneLine(it.cwd ?? '')}` },
+               it.title || it.id,
+             ),
+             h('span', { key: 'm', title: it.trashedAt ?? '', style: { fontSize: 11, color: T.secondary, flexShrink: 0, width: 64, textAlign: 'right' } }, fmtAgo(it.trashedAt ? Date.parse(it.trashedAt) : 0)),
+@@ -1701,7 +1709,7 @@ window.__ModuleLoader__.load({
+                     h('div', { key: 'h', className: 'sd-grouphd', onClick: () => toggleGroupOpen(key), title: open ? '点击折叠' : '点击展开' }, [
+                       h('span', { key: 'ch', className: 'sd-chev', style: { transform: open ? 'rotate(90deg)' : 'none' } }, svgEl(ICON_PATH_CHEVRON, 14)),
+                       h('span', { key: 'fo', style: { display: 'inline-flex', color: T.secondary } }, svgEl(ICON_PATH_FOLDER, 15)),
+-                      h('span', { key: 'n', style: { fontSize: 13, fontWeight: 600, color: T.label, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, title: meta.path }, meta.name),
++                      h('span', { key: 'n', style: { fontSize: 13, fontWeight: 600, color: T.label, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, title: oneLine(meta.path) }, meta.name),
+                       h('span', { key: 'sp', style: { flex: 1 } }),
+                       h('span', { key: 'i', style: { fontSize: 13, color: T.secondary, flexShrink: 0, fontVariantNumeric: 'tabular-nums' } }, `${groupSessions.length} 个会话`),
+                     ]),
+@@ -1751,7 +1759,7 @@ window.__ModuleLoader__.load({
+                         onClick: (e) => e.stopPropagation(),
+                         style: { accentColor: T.brand, cursor: 'pointer' },
+                       }),
+-                      h('span', { key: 'n', style: { fontSize: 12, fontWeight: 600, color: T.secondary, letterSpacing: 0.3, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, title: meta.path }, meta.name),
++                      h('span', { key: 'n', style: { fontSize: 12, fontWeight: 600, color: T.secondary, letterSpacing: 0.3, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, title: oneLine(meta.path) }, meta.name),
+                       h('span', { key: 'i', style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary, var(--dsw-alias-label-secondary))', flexShrink: 0 } }, `${groupSessions.length} 会话 · ${fmtSize(groupSessions.reduce((a, s) => a + (s.sizeBytes ?? 0), 0))}`),
+                     ]),
+                     ...groupSessions.map((s) => sessionRow(s, { indent: true, singleDelete: true, restore: s.archived && unarchiveSupported })),
