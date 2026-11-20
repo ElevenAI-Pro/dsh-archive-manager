@@ -26,21 +26,10 @@
  *   3. sessionPersistence.locate(header) 定位真实磁盘目录（不硬编码路径）；
  *   4. rename 移入 <DSH_HOME>/trash/sessions/<时间戳>-<转义id>/data/（回收站；
  *      id 经 encodeEntrySegment 转义成文件系统安全片段，见 ID_RE 注释 / issue #3）；
- *   5. 归档 id 保留（keptHidden），运行期间永不摘除：
- *      客户端侧栏的行来自内存 list store——只有 host/session-removed 帧
- *      （仅 live 会话 dispose 时宿主才发）或全新的 session.list 基线才能把
- *      行移除；冷会话被删后宿主不发任何帧，行一直留在已连接客户端的 store
- *      里。此时若把 id 摘出归档集，archived-sessions-changed 广播会把这条
- *      残留行重新显示回侧栏（"删除后又回到工作区"）；live 会话同理（宿主
- *      session.list 无条件从内存吐活会话，DSH 也没有公开的他人 agent 卸载
- *      API——dispose 闭包私有于 agent-loop 工厂）。归档集只是隐藏标记：
- *      没有行的 ghost id 在官方 UI 里不渲染任何东西，保留代价为零。
- *      ghost 的最终清理由「宿主重启时的 reconcile」完成（见 apply 尾部）：
- *      重启后所有客户端都用全新基线重建 store，已删会话的行不复存在，此时
- *      摘除归档 id 不可能复活任何东西。操作方客户端删除后还会主动调
- *      sessions.refresh() 剪掉自己 store 里的残留行（见 client 半）。
- *      live 会话后续的 flush 会因父目录已移走而 ENOENT 失败（append 用
- *      open("a") 但目录不存在），不会在磁盘上重建会话。
+ *   5. 广播 removed 并从各工作区 detachSession；仅在引用已断开且会话不再
+ *      驻留时清理归档/置顶标记，避免残留列表重新出现。驻留 idle agent 没有
+ *      公开卸载 API，因此暂时保留其隐藏标记，并通过宿主取消归档钩子拒绝复活。
+ *      再次删除已无文件的会话为幂等清理，不再返回 NOT_FOUND。
  *
  * 审计：<DSH_HOME>/trash/sessions/audit.log（JSONL 追加）。
  *
@@ -266,6 +255,39 @@ export function apply(ctx) {
     }
   }
 
+  // 删除是磁盘、工作区引用和客户端列表的共同状态，不能只靠归档隐藏。
+  function hasLiveSession(id) {
+    return agentState(id).live || Boolean(ctx.get?.('sessions')?.get?.(id))
+  }
+
+  async function workspaceEntries() {
+    return (await ctx.workspaceRegistry.list()) ?? []
+  }
+
+  async function cleanDeletedReferences(ids) {
+    const targets = [...new Set(ids)]
+    const workspaces = await workspaceEntries()
+    const detached = new Set(targets)
+    for (const id of targets) {
+      ctx.emit?.('api-session/removed', id)
+      recordCache.delete(id)
+      for (const workspace of workspaces) {
+        if (!workspace.sessionIds?.includes(id)) continue
+        if (typeof workspace.detachSession !== 'function') {
+          detached.delete(id)
+          continue
+        }
+        await workspace.detachSession(id)
+      }
+    }
+    // 先移除工作区引用和客户端行，再清归档标记。仍驻留的 idle agent
+    // 没有公开卸载 API，保留隐藏标记并禁止取消归档，直到宿主释放它。
+    const cold = targets.filter((id) => detached.has(id) && !hasLiveSession(id))
+    const forgotten = await forgetArchivedSessions(cold)
+    for (const id of targets) ctx.emit?.('api-session/removed', id)
+    return forgotten
+  }
+
   /**
    * 在线取消归档（archiveSession 的对称反操作）。
    *
@@ -289,6 +311,11 @@ export function apply(ctx) {
   }
 
   async function unarchiveSession(id) {
+    const { byId } = await inventory()
+    if (!byId.has(id)) {
+      await cleanDeletedReferences([id])
+      throw httpError(410, 'GONE', '会话数据已删除，不能取消归档；已清理残留条目')
+    }
     const registry = ctx.workspaceRegistry
     if (!registryCanUnarchive()) {
       throw httpError(501, 'UNSUPPORTED', '当前 DSH 的 workspaceRegistry 不支持在线取消归档；请停止 DSH 后运行 tools/unhide.mjs')
@@ -329,13 +356,16 @@ export function apply(ctx) {
     try {
       return await registry.enqueueOperation(async () => {
         const state = registry.requireState()
-        if (!Array.isArray(state.archivedSessionIds) || state.archivedSessionIds.length === 0) return 0
-        const next = state.archivedSessionIds.filter((id) => !drop.has(id))
-        const removed = state.archivedSessionIds.length - next.length
-        if (removed === 0) return 0
+        const archived = state.archivedSessionIds ?? []
+        const next = archived.filter((id) => !drop.has(id))
+        const removed = archived.length - next.length
+        const pinned = state.pinnedSessionIds ?? []
+        const nextPinned = pinned.filter((id) => !drop.has(id))
+        if (removed === 0 && nextPinned.length === pinned.length) return 0
         await registry.setState({
           ...state,
           archivedSessionIds: next,
+          ...(Array.isArray(state.pinnedSessionIds) ? { pinnedSessionIds: nextPinned } : {}),
         })
         return removed
       })
@@ -345,22 +375,18 @@ export function apply(ctx) {
   }
 
   /**
-   * 清掉「归档集里有、磁盘清单里没有」的历史 ghost。
-   * 只在宿主重启（插件重新挂载）时调用：此刻所有客户端都会用全新基线重建
-   * list store，已删会话的行不复存在，摘除归档 id 不会复活任何东西。
-   * 运行期间绝不调用——长连客户端的 store 可能还持有已删会话的残留行，
-   * 摘除归档会把它们显示回侧栏。
-   * live 会话除外（boot 时配置启动的 agent 已 resume，但它们都在盘上，
-   * 不会命中 ghost 条件；保留检查作纵深防御）。
+   * 挂载时修复归档集与工作区中的历史残留引用。只处理磁盘不存在且没有
+   * live Session/Agent 的条目；先广播移除并 detach，最后清理隐藏标记。
    */
   async function reconcileArchivedGhosts() {
-    if (!registryCanUnarchive()) return 0
-    const archived = [...archivedSet()]
-    if (archived.length === 0) return 0
+    const candidates = new Set(archivedSet())
+    for (const workspace of await workspaceEntries()) {
+      for (const id of workspace.sessionIds ?? []) candidates.add(id)
+    }
     const { byId } = await inventory()
-    const ghosts = archived.filter((id) => !byId.has(id) && !agentState(id).live)
+    const ghosts = [...candidates].filter((id) => !byId.has(id) && !hasLiveSession(id))
     if (ghosts.length === 0) return 0
-    const forgotten = await forgetArchivedSessions(ghosts)
+    const forgotten = await cleanDeletedReferences(ghosts)
     if (forgotten > 0) await audit('reconcile-archived-ghosts', { count: forgotten, ids: ghosts.slice(0, 20) })
     return forgotten
   }
@@ -704,11 +730,8 @@ export function apply(ctx) {
       const title = typeof cached?.title === 'string' ? cached.title : typeof folded.get(tid) === 'string' ? folded.get(tid) : null
       entries.push({ id: tid, ...(await moveOneToTrash(tid, h, title)) })
     }
-    for (const tid of targets) {
-      ctx.emit?.('api-session/removed', tid)
-      recordCache.delete(tid)
-    }
-    // 归档 id 保留不摘（ghost 待宿主重启 reconcile 统一清理，见文件头第 5 步）。
+    await cleanDeletedReferences(targets)
+    // 驻留会话保留隐藏标记；冷会话的工作区和归档引用已经同步清理。
     const keptHidden = archivedSet().has(id)
     await audit('delete', { id, cascade: children.length, entries: entries.map((e) => e.entry), keptHidden })
     return { id, ok: true, entry: (entries.find((e) => e.id === id) ?? {}).entry, cascade: children.length, keptHidden }
@@ -798,6 +821,16 @@ export function apply(ctx) {
     await mkdir(dirname(targetDir), { recursive: true })
     await rename(dataDir, targetDir)
     await rm(entryDir, { recursive: true, force: true }).catch(() => {})
+    let workspaceRestored = true
+    try {
+      for (const workspace of await workspaceEntries()) {
+        if (workspace.path === meta.cwd && typeof workspace.attachSession === 'function') {
+          await workspace.attachSession(meta.id)
+        }
+      }
+    } catch {
+      workspaceRestored = false
+    }
     // 文件已归位，紧接着在线解除归档：会话直接回到侧栏原分组，一步到位。
     // 旧版 DSH（无内部状态机）保持旧行为：文件还原、归档态保留，由客户端
     // 提示离线 unhide 步骤——文件操作永远不因解档失败而回滚。
@@ -833,7 +866,7 @@ export function apply(ctx) {
       /* 客户端列表补回失败不影响还原结果 */
     }
     recordCache.delete(meta.id)
-    return { id: meta.id, ok: true, stillArchived }
+    return { id: meta.id, ok: true, stillArchived, workspaceRestored }
   }
 
   async function purge(entry, all) {
@@ -889,9 +922,13 @@ export function apply(ctx) {
     if (typeof id !== 'string' || !ID_RE.test(id)) throw httpError(400, 'INVALID_ID', '会话 id 非法')
     const { byId } = await inventory()
     const header = byId.get(id)
-    if (header === undefined) throw httpError(404, 'NOT_FOUND', `会话 ${id} 不存在于磁盘记录（可能已删除）`)
     const agent = agentState(id)
     if (agent.running) throw httpError(409, 'RUNNING', '会话正在运行（模型或子代理未结束），请稍后再试')
+    if (header === undefined) {
+      await cleanDeletedReferences([id])
+      await audit('delete-permanent', { id, alreadyDeleted: true, removedDirs: 0 })
+      return { id, ok: true, alreadyDeleted: true, cascade: 0 }
+    }
     // 级联目标：全部后代子代理；任何一个在运行都整体拒绝（绝不留下半删状态）
     const children = descendantsOf(byId, id)
     const runningChild = children.find((cid) => agentState(cid).running)
@@ -919,10 +956,7 @@ export function apply(ctx) {
         removedDirs += 1
       }
     }
-    for (const target of targets) {
-      ctx.emit?.('api-session/removed', target)
-      recordCache.delete(target)
-    }
+    await cleanDeletedReferences(targets)
     await audit('delete-permanent', { id, cascade: children.length, removedDirs })
     return { id, ok: true, cascade: children.length }
   }
@@ -1092,6 +1126,7 @@ export function apply(ctx) {
     let skippedRunning = 0
     let freedBytes = 0
     const failures = []
+    const deleted = []
     for (const id of targets) {
       const agent = agentState(id)
       if (agent.running) {
@@ -1107,14 +1142,14 @@ export function apply(ctx) {
           await rm(dir, { recursive: true, force: true })
         }
         purged += 1
-        ctx.emit?.('api-session/removed', id)
-        recordCache.delete(id)
+        deleted.push(id)
       } catch (error) {
         failed += 1
         if (failures.length < 10) failures.push({ id, message: String(error?.message ?? error) })
       }
     }
-    await audit('purge-archived', { count: purged, failed, skippedRunning })
+    await cleanDeletedReferences(deleted)
+    await audit('purge-archived', { count: purged, failed, skippedRunning, ids: deleted })
     return { ok: true, purged, failed, skippedRunning, freedBytes, failures }
   }
 
@@ -1182,7 +1217,7 @@ export function apply(ctx) {
       path: `${PREFIX}/list`,
       handler: guard(async (req, res) => {
         if (req.method !== 'GET') return sendJson(res, 405, { error: { code: 'METHOD', message: 'GET only' } })
-        // 运行期间不做 ghost reconcile（见 reconcileArchivedGhosts 注释）。
+        // 列表读取不修改数据；历史残留在挂载时修复。
         const [sessions, workspaces] = await Promise.all([sessionRecords(), workspacesView()])
         sendJson(res, 200, {
           ok: true,
@@ -1462,11 +1497,16 @@ export function apply(ctx) {
   // 插件卸载/停止时清掉自动归档定时器。
   ctx.effect(() => stopAutoArchiveTimer, 'session-delete: auto-archive timer cleanup')
 
-  // 宿主重启时 reconcile 一次历史归档 ghost（fire-and-forget）。
-  // 此刻所有客户端都将以全新基线重建 list store，已删会话的行不复存在，
-  // 摘除归档 id 是安全的；运行期间则绝不摘除（详见 reconcileArchivedGhosts）。
-  // inject 保证 workspaceRegistry/sessionPersistence 在 apply 前完成 init，
-  // requireState 此处不会抛 "not started yet"。
+  // 官方菜单也会调用取消归档；不能让已删的驻留会话重新出现在侧边栏。
+  if (typeof ctx.on === 'function') {
+    ctx.on('workspace/session-unarchiving', async ({ sessionId }) => {
+      if (!(await inventory()).byId.has(sessionId)) {
+        throw httpError(410, 'GONE', '此会话已删除，不能取消归档')
+      }
+    })
+  }
+
+  // 挂载时修复历史残留。inject 保证依赖服务已初始化；不删除任何会话文件。
   reconcileArchivedGhosts().catch(() => {})
   // fork：按已保存的配置恢复自动归档定时扫描。
   scheduleAutoArchive()

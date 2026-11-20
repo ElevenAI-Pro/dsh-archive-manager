@@ -37,7 +37,7 @@ window.__ModuleLoader__.load({
     const PREFIX = '/api/session-delete'
     const HDR = 'x-dsh-plugin'
     // 构建标记：随每次代码变更手动更新，经 /debug 上报用于确认页面运行的代码版本
-    const BUILD = 'sd-0.6.0-20261119-rename'
+    const BUILD = 'sd-1.2.3-deleted-session-cleanup'
 
     // ---------- 交互样式（注入 <style>，随插件停止移除） ----------
     const CSS = `
@@ -1101,6 +1101,10 @@ window.__ModuleLoader__.load({
           })
         } catch (e) {
           const code = e?.data?.error?.code
+          if (code === 'GONE') {
+            removeDeletedLocally([id])
+            refreshClientSessionList()
+          }
           setNotice({
             kind: code === 'UNSUPPORTED' ? 'warn' : 'err',
             title: '还原失败',
@@ -1157,6 +1161,8 @@ window.__ModuleLoader__.load({
               detail: '当前 DSH 版本无法在线解除归档；彻底找回见 README 的 unhide 步骤',
               at: at(),
             })
+          } else if (r.workspaceRestored === false) {
+            setNotice({ kind: 'warn', title: '文件已还原，工作区关联未恢复', detail: '会话文件已保存，请刷新工作区后重试。', at: at() })
           } else {
             setNotice({ kind: 'ok', title: `已还原（${shortId(r.id ?? '')}）`, detail: '已解除归档 · 侧栏原分组立即可见', at: at() })
           }

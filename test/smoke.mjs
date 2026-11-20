@@ -25,6 +25,8 @@ function check(name, cond, detail) {
 const home = mkdtempSync(join(tmpdir(), 'sd-smoke-'))
 const headersById = new Map()
 const runningSet = new Set()
+const liveSet = new Set()
+const workspaceSessionIds = new Set()
 function makeSession(id, { ageDays = 0, size = 32, parentSession } = {}) {
   const dir = join(home, 'sessions', 'proj', id)
   mkdirSync(dir, { recursive: true })
@@ -35,6 +37,7 @@ function makeSession(id, { ageDays = 0, size = 32, parentSession } = {}) {
     utimesSync(file, t, t)
   }
   headersById.set(id, parentSession === undefined ? { id, cwd: join(home, 'proj') } : { id, cwd: join(home, 'proj'), parentSession })
+  workspaceSessionIds.add(id)
   return dir
 }
 
@@ -59,7 +62,16 @@ const routes = new Map()
 const disposals = []
 const emitted = []
 const archivedCalls = []
-const state = { archivedSessionIds: [ARCHIVED], pinnedSessionIds: [PINNED] }
+const STALE = 'session-stale001'
+workspaceSessionIds.add(STALE)
+const state = { archivedSessionIds: [ARCHIVED, STALE], pinnedSessionIds: [PINNED] }
+const events = new Map()
+const workspace = {
+  id: 'proj', path: join(home, 'proj'), title: 'Project',
+  get sessionIds() { return [...workspaceSessionIds] },
+  detachSession: async (id) => { workspaceSessionIds.delete(id) },
+  attachSession: async (id) => { workspaceSessionIds.add(id) },
+}
 
 const ctx = {
   effect(fn, label) {
@@ -68,7 +80,8 @@ const ctx = {
     return dispose
   },
   emit: (event, id) => emitted.push([event, id]),
-  get: () => undefined,
+  get: (key) => key === 'sessions' ? { get: (id) => liveSet.has(id) ? { id } : undefined } : undefined,
+  on: (name, fn) => events.set(name, fn),
   webServer: { register: (route) => routes.set(route.path, route.handler) },
   sessionPersistence: {
     // 磁盘驱动：日志文件消失的会话自动从清单中排除（与真实持久化一致）
@@ -79,7 +92,7 @@ const ctx = {
     locate: (header) => ({ path: join(home, 'sessions', 'proj', header.id, 'session.v3.jsonl.zstd') }),
   },
   workspaceRegistry: {
-    archivedSessionIds: state.archivedSessionIds,
+    get archivedSessionIds() { return state.archivedSessionIds },
     archiveSession: async (id) => {
       archivedCalls.push(id)
       if (!state.archivedSessionIds.includes(id)) state.archivedSessionIds.push(id)
@@ -89,12 +102,13 @@ const ctx = {
       const idx = state.archivedSessionIds.indexOf(id)
       if (idx !== -1) state.archivedSessionIds.splice(idx, 1)
     },
-    list: () => [],
+    list: () => [workspace],
     get: () => undefined,
     requireState: () => state,
     enqueueOperation: async (fn) => fn(),
     setState: async (next) => {
       state.archivedSessionIds = next.archivedSessionIds
+      state.pinnedSessionIds = next.pinnedSessionIds
     },
   },
   agents: { get: (id) => (runningSet.has(id) ? { status: 'running' } : undefined) },
@@ -175,7 +189,7 @@ expectRoutes()
   const csrf = await call('/api/session-delete/delete-permanent', { method: 'POST', withHeader: false, body: { id: COLD } })
   check('delete-permanent without header -> 403', csrf.status === 403, csrf)
   const missing = await call('/api/session-delete/delete-permanent', { method: 'POST', body: { id: 'session-nope0001' } })
-  check('delete-permanent unknown id -> 404', missing.status === 404 && missing.body.error.code === 'NOT_FOUND', missing)
+  check('delete-permanent absent id is idempotent', missing.status === 200 && missing.body.alreadyDeleted === true, missing)
   const bad = await call('/api/session-delete/delete-permanent', { method: 'POST', body: { id: 'bad id/with slash' } })
   check('delete-permanent invalid id -> 400', bad.status === 400 && bad.body.error.code === 'INVALID_ID', bad)
   const ok = await call('/api/session-delete/delete-permanent', { method: 'POST', body: { id: COLD } })
@@ -183,10 +197,41 @@ expectRoutes()
   check('delete-permanent removed dir', !existsSync(dirs[COLD]))
   check('delete-permanent archived first', archivedCalls.includes(COLD))
   check('delete-permanent emitted removed', emitted.some(([ev, id]) => ev === 'api-session/removed' && id === COLD))
+  check('delete-permanent detaches workspace membership', !workspaceSessionIds.has(COLD))
+  check('delete-permanent clears cold archive marker', !state.archivedSessionIds.includes(COLD))
+  const repeat = await call('/api/session-delete/delete-permanent', { method: 'POST', body: { id: COLD } })
+  check('delete-permanent repeat succeeds without a disk record', repeat.status === 200 && repeat.body.alreadyDeleted === true, repeat)
+  const unarchive = await call('/api/session-delete/unarchive', { method: 'POST', body: { id: COLD } })
+  check('deleted session cannot be unarchived', unarchive.status === 410 && unarchive.body.error.code === 'GONE', unarchive)
   const run = await call('/api/session-delete/delete-permanent', { method: 'POST', body: { id: RUNNING } })
   check('delete-permanent running -> 409', run.status === 409 && run.body.error.code === 'RUNNING', run)
   const audit = readFileSync(join(home, 'trash', 'sessions', 'audit.log'), 'utf8')
   check('audit has delete-permanent', audit.includes('"action":"delete-permanent"'))
+  check('startup prunes missing workspace rows', !workspaceSessionIds.has(STALE))
+  check('startup prunes missing archive markers', !state.archivedSessionIds.includes(STALE))
+}
+
+// A missing legacy row can have been unarchived already: it still needs cleanup.
+{
+  const id = 'session-ghost001'
+  workspaceSessionIds.add(id)
+  const r = await call('/api/session-delete/delete-permanent', { method: 'POST', body: { id } })
+  check('missing legacy row cleanup succeeds', r.status === 200 && r.body.alreadyDeleted === true, r)
+  check('missing legacy row is detached', !workspaceSessionIds.has(id))
+}
+
+// A live session with missing files must stay hidden, including the native menu.
+{
+  const id = 'session-live0001'
+  makeSession(id)
+  liveSet.add(id)
+  const r = await call('/api/session-delete/delete-permanent', { method: 'POST', body: { id } })
+  check('deleted resident session remains hidden', r.status === 200 && state.archivedSessionIds.includes(id), r)
+  check('deleted resident session is detached', !workspaceSessionIds.has(id))
+  let code
+  try { await events.get('workspace/session-unarchiving')({ sessionId: id }) } catch (e) { code = e.code }
+  check('native unarchive blocks a deleted resident session', code === 'GONE', code)
+  liveSet.delete(id)
 }
 
 // ---- /delete 软删除级联（fork：子代理跟随进回收站，可独立还原）----
@@ -204,6 +249,8 @@ expectRoutes()
   const rs = await call('/api/session-delete/restore', { method: 'POST', body: { entry: parentEntry } })
   check('restore parent -> 200', rs.status === 200 && rs.body.ok === true, rs)
   check('parent dir restored', existsSync(join(home, 'sessions', 'proj', P, 'session.v3.jsonl.zstd')))
+  check('restored session unarchives successfully', !state.archivedSessionIds.includes(P))
+  check('restored session returns to its workspace', workspaceSessionIds.has(P) && rs.body.workspaceRestored === true)
   const dp = await call('/api/session-delete/delete-permanent', { method: 'POST', body: { id: P } })
   check('cleanup: restored parent permanently deleted -> 200', dp.status === 200, dp)
 }
@@ -283,6 +330,8 @@ expectRoutes()
   check('purge-archived freed bytes', r.body.freedBytes > 0, r.body)
   check('ARCHIVED dir gone', !existsSync(dirs[ARCHIVED]))
   check('OLDAUTO dir gone', !existsSync(dirs[OLDAUTO]))
+  check('purge-archived removes workspace rows', !workspaceSessionIds.has(ARCHIVED) && !workspaceSessionIds.has(OLDAUTO))
+  check('purge-archived removes cold archive markers', !state.archivedSessionIds.includes(ARCHIVED) && !state.archivedSessionIds.includes(OLDAUTO))
   const again = await call('/api/session-delete/purge-archived', { method: 'POST', body: {} })
   check('purge-archived idempotent on disk (freed=0)', again.status === 200 && again.body.freedBytes === 0, again)
 }

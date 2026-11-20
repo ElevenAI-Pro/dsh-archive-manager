@@ -1,6 +1,6 @@
 {
   "name": "dsh-archive-management",
-  "version": "1.2.2",
+  "version": "1.2.3",
   "description": "Real session deletion for DeepSeek Harness: settings-page manager with trash & restore + sidebar permanent delete (Codex style) + auto-archive with retention (zcodex style). Fork of xohmai/dsh-session-delete.",
   "type": "module",
   "license": "Apache-2.0",
